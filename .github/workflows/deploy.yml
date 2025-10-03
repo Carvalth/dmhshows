@@ -1,39 +1,43 @@
-name: Deploy to Surge
+name: Scrape & Deploy to Surge
 
 on:
-  workflow_dispatch:        # Run button
+  workflow_dispatch:
   push:
-    branches: [ main ]      # Deploy on pushes to main
+    branches: [ main ]
+  schedule:
+    - cron: "0 */6 * * *"   # every 6h UTC
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     env:
-      DOMAIN: dmhshows.surge.sh     # <-- put YOUR Surge domain
-      DEPLOY_DIR: ./public.          # <-- use ./ if index.html is at repo root
+      DOMAIN: dmhshows.surge.sh   # <-- your Surge domain
+      DEPLOY_DIR: ./public
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show repo layout (diagnostic)
+      - name: Show repo layout
         run: |
-          echo "PWD = $PWD"
+          echo "PWD=$PWD"
           ls -la
-          echo "---- $DEPLOY_DIR ----"
-          ls -la "$DEPLOY_DIR" || true
+          echo "---- public ----"
+          ls -la public || true
 
-      - name: Verify site folder exists
+      - name: Install scraper deps (Playwright + Chromium)
         run: |
-          if [ ! -d "$DEPLOY_DIR" ]; then
-            echo "::error::DEPLOY_DIR $DEPLOY_DIR not found. Set DEPLOY_DIR=./ or create public/"
-            exit 1
-          fi
-          if [ ! -f "$DEPLOY_DIR/index.html" ]; then
-            echo "::error::No index.html in $DEPLOY_DIR"
-            exit 1
-          fi
+          npm ci || npm i
+          npx playwright install --with-deps chromium
+
+      - name: Run scraper (writes public/dmh-events.json)
+        run: npm run scrape
+
+      - name: Verify build output
+        run: |
+          test -f "$DEPLOY_DIR/index.html" || (echo "::error::index.html missing in $DEPLOY_DIR" && exit 1)
+          test -f "$DEPLOY_DIR/dmh-events.json" || (echo "::warning::dmh-events.json missing; scraper may have produced no events")
 
       - name: Install Surge CLI
         run: npm i -g surge
