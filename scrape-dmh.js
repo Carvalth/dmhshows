@@ -1,113 +1,115 @@
 #!/usr/bin/env node
-import { chromium } from "playwright";
 import fs from "fs";
+import path from "path";
+import { chromium } from "playwright";
 
-const START_URL = "https://www.demontforthall.co.uk/whats-on/";
-const MAX_PAGES = 10;
+const OUT = path.resolve("./public/dmh-events.json");
 
-async function extractFromListing(page) {
-  const rows = await page.$$eval(
-    'article, li, .card, .event, .grid-item, .content, .col',
-    (cards) => {
-      const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-      function statusFromText(txt = "") {
-        const s = txt.toLowerCase();
-        if (s.includes("sold out")) return "SOLD OUT";
-        if (/very\s*limited|limited|last\s*(few|remaining)|almost\s*sold|low\s*availability/.test(s)) return "LIMITED";
-        if (s.includes("selling fast") || s.includes("best availability")) return "SELLING FAST";
-        if (s.includes("book now") || s.includes("on sale") || s.includes("available")) return "BOOK NOW";
-        return "";
-      }
-
-      return cards
-        .map((card) => {
-          const title =
-            clean(
-              card.querySelector("h2,h3,h4,.event-title,.card-title")?.textContent
-            ) ||
-            clean(
-              card.querySelector('a[href*="/event/"],a[href*="/events/"]')
-                ?.textContent
-            );
-          if (!title || /^more info$/i.test(title)) return null;
-
-          const dateText =
-            clean(
-              card.querySelector(
-                "time,.date,.event-date,.when,[class*='date']"
-              )?.textContent
-            ) || "";
-
-          const full = clean(card.innerText || "");
-          let status = statusFromText(full);
-
-          // Also check any button/anchor inside the card specifically
-          if (!status) {
-            const btn = clean(
-              card.querySelector(
-                "a,button,.buy-btn,.cta,[class*='book']"
-              )?.textContent
-            );
-            if (btn) status = statusFromText(btn);
-          }
-
-          return { title, dateText, status };
-        })
-        .filter(Boolean);
-    }
-  );
-
-  return rows.map((r) => ({
-    title: r.title,
-    start: (() => {
-      const t = (r.dateText || "").trim();
-      if (!t) return null;
-      if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t;
-      const d = Date.parse(t);
-      return Number.isFinite(d) ? new Date(d).toISOString() : null;
-    })(),
-    status: r.status,
-    override_pct: (() => {
-      const s = (r.status || "").toLowerCase();
-      if (s === "sold out") return 100;
-      if (s === "limited") return 92;
-      if (s === "selling fast") return 70;
-      if (s === "book now") return 48;
-      return 30;
-    })(),
-  }));
+// --- helper to parse the DMH date string into ISO
+function parseDateToISO(text) {
+  if (!text) return null;
+  // DMH seems like "Mon 6 Oct 2025"
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  const parts = cleaned.match(/\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+  if (!parts) return null;
+  const day = parts[1];
+  const month = parts[2];
+  const year = parts[3];
+  const date = new Date(`${day} ${month} ${year}`);
+  return isNaN(date) ? null : date.toISOString();
 }
 
-async function run() {
+function statusFromText(raw) {
+  const t = (raw || "").toUpperCase().replace(/\s+/g, " ").trim();
+  if (/\bSOLD[-\s]*OUT\b/.test(t)) return "SOLD OUT";
+  if (/\bBOOK\s*NOW\b/.test(t)) return "BOOK NOW";
+  if (/\bON\s*SALE\s*SOON\b/.test(t)) return "ON SALE SOON";
+  if (/\bLIMITED\b/.test(t)) return "LIMITED";
+  return "";
+}
+
+// --- open Ticketsolve and check its availability
+async function getTicketsolveStatus(context, url) {
+  const page = await context.newPage();
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const txt = await page.evaluate(() => document.body.innerText || "");
+    const s = statusFromText(txt);
+    if (s) return s;
+
+    // fallback: disabled purchase button
+    const disabledBtn = await page.$('button[disabled], .button[disabled], .btn[disabled]');
+    if (disabledBtn) return "SOLD OUT";
+
+    const badges = await page.$$eval(
+      '*, [class*="status"], [class*="availability"], [class*="ticket"]',
+      els => els.slice(0, 200).map(e => (e.innerText || e.textContent || ""))
+    );
+    for (const b of badges) {
+      const s2 = (b || "").toUpperCase();
+      if (s2.includes("SOLD OUT")) return "SOLD OUT";
+      if (s2.includes("ON SALE SOON")) return "ON SALE SOON";
+      if (s2.includes("LIMITED")) return "LIMITED";
+    }
+    return "BOOK NOW";
+  } catch {
+    return "";
+  } finally {
+    await page.close();
+  }
+}
+
+async function scrape() {
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
   const events = [];
+  for (let pageNum = 1; pageNum <= 8; pageNum++) {
+    const url = pageNum === 1
+      ? "https://www.demontforthall.co.uk/whats-on/"
+      : `https://www.demontforthall.co.uk/whats-on/page/${pageNum}/`;
 
-  for (let i = 1; i <= MAX_PAGES; i++) {
-    const url = i === 1 ? START_URL : `${START_URL}page/${i}/`;
-    console.log(`[info] ${url}`);
-    try {
-      await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
-      await page.waitForTimeout(1000); // small extra wait so text swaps in
-      const items = await extractFromListing(page);
-      console.log(`   -> ${items.length} cards`);
-      if (!items.length && i > 1) break;
-      events.push(...items);
-    } catch (err) {
-      console.warn(`[warn] failed on ${url}`, err.message);
+    console.log("[info]", url);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    const cards = await page.$$(".card-event");
+    console.log(`[info] found ${cards.length} cards on page ${pageNum}`);
+
+    for (const el of cards) {
+      const title = (await el.$eval(".title", n => n.innerText)).trim();
+
+      const dateText = await el.$eval(".date", n => n.innerText).catch(() => "");
+      const startISO = parseDateToISO(dateText);
+
+      const ctaHref = await el.$eval("a.cta.cta--primary", a => a.href).catch(() => "");
+
+      const cardText = await el.evaluate(n => n.innerText || n.textContent || "");
+      let status = statusFromText(cardText);
+
+      if (!status && ctaHref) {
+        status = await getTicketsolveStatus(context, ctaHref);
+      }
+      if (!status && ctaHref) status = "BOOK NOW";
+
+      const override_pct =
+        status === "SOLD OUT" ? 100 :
+        status === "BOOK NOW" ? 48 :
+        30;
+
+      events.push({ title, start: startISO, status, override_pct });
     }
   }
 
   await browser.close();
 
-  if (!fs.existsSync("./public")) fs.mkdirSync("./public", { recursive: true });
-  fs.writeFileSync("./public/dmh-events.json", JSON.stringify(events, null, 2));
-  console.log(`Wrote ${events.length} events -> public/dmh-events.json`);
+  console.log(`Wrote ${events.length} events -> ${OUT}`);
+  fs.mkdirSync(path.dirname(OUT), { recursive: true });
+  fs.writeFileSync(OUT, JSON.stringify(events, null, 2));
 }
 
-run().catch((err) => {
-  console.error(err);
+scrape().catch(e => {
+  console.error(e);
   process.exit(1);
 });
 
