@@ -403,5 +403,23 @@
     // Init
     renderAll();
   </script>
+  <script>
+  async function loadEventsFrom(url){
+    const res = await fetch(url, { cache: 'no-store' });
+    const data = await res.json();
+    state.events = data.map(e => ({
+      title: e.title,
+      start: e.start,
+      status: e.status,
+      tickets_total: e.tickets_total || 0,
+      tickets_sold: e.tickets_sold || 0,
+      override_pct: typeof e.override_pct === 'number' ? e.override_pct : undefined
+    }));
+    renderAll();
+  }
+  loadEventsFrom('/dmh-events.json');
+  // Optional periodic refresh:
+  // setInterval(() => loadEventsFrom('/dmh-events.json'), 6 * 60 * 60 * 1000);
+</script>
 </body>
 </html>
