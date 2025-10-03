@@ -1,10 +1,17 @@
-// scrape-dmh.js — list-page only (avoids 403 on event pages)
+// scrape-dmh.js — robust list-page scraper with debug output
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 
 const START_URL = 'https://www.demontforthall.co.uk/whats-on/';
 const OUT = path.join('public', 'dmh-events.json');
+const DEBUG_DIR = 'public/debug';
+
+const ua =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
 function statusToPct(label = '') {
   const s = label.toLowerCase();
@@ -14,24 +21,29 @@ function statusToPct(label = '') {
   if (/(book\s*now|on\s*sale|available)/.test(s)) return 48;
   return 30;
 }
-const clean = x => (x || '').replace(/\s+/g, ' ').trim();
 
 async function acceptCookies(page) {
-  const choices = [
+  const sels = [
     '#onetrust-accept-btn-handler',
     'button:has-text("Accept all")',
     'button:has-text("Accept All")',
     'button:has-text("Accept")',
-    'button[aria-label*="accept"]',
+    '[aria-label*="accept" i]'
   ];
-  for (const sel of choices) {
+  for (const sel of sels) {
     const btn = await page.$(sel).catch(() => null);
     if (btn) { await btn.click().catch(()=>{}); break; }
   }
 }
 
-// Try to click “Load more” until there’s no more
-async function loadAll(page) {
+async function scrollToBottom(page, passes = 10) {
+  for (let i = 0; i < passes; i++) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(800);
+  }
+}
+
+async function clickLoadMore(page) {
   for (;;) {
     const more = await page.$('button:has-text("Load more"), button:has-text("Show more"), a:has-text("Load more")');
     if (!more) break;
@@ -40,76 +52,78 @@ async function loadAll(page) {
   }
 }
 
-// Pull data from a card element
-async function extractFromCard(card) {
-  return await card.evaluate(node => {
-    const t = (sel) => (node.querySelector(sel)?.textContent || '').replace(/\s+/g,' ').trim();
-    const a = (node.querySelector('a[href]')?.getAttribute('href')) || '';
-    const title = t('h3, .card-title, .event-title, h2, h4');
-    const dateText = t('time, .date, .event-date, .when');
-    const status = t('.availability, .status, .badge, [class*="availability"]');
-    return { href: a, title, dateText, status };
-  });
-}
-
 function normalizeStart(dateText) {
-  if (!dateText) return null;
-  // If it’s already ISO-like, pass through
-  if (/^\d{4}-\d{2}-\d{2}/.test(dateText)) return dateText;
-  const parsed = Date.parse(dateText);
+  const t = clean(dateText);
+  if (!t) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t;
+  const parsed = Date.parse(t);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    viewport: { width: 1366, height: 900 },
+    userAgent: ua,
+    locale: 'en-GB',
+    viewport: { width: 1366, height: 900 }
   });
   const page = await context.newPage();
 
+  await page.route('**/*', route => {
+    // skip heavy trackers
+    const url = route.request().url();
+    if (/\.(png|jpg|jpeg|gif|webp|svg|woff2?)$/i.test(url)) return route.continue();
+    route.continue();
+  });
+
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await acceptCookies(page);
+  await page.waitForLoadState('networkidle').catch(()=>{});
 
-  // In case items are infinite-scrolled
-  await loadAll(page);
-  await page.waitForTimeout(800);
+  // Try to reveal all events
+  await clickLoadMore(page);
+  await scrollToBottom(page, 12);
+  await page.waitForTimeout(1000);
 
-  // Try a few common card wrappers (adjust if needed)
-  const cardSelectors = [
+  // DEBUG: dump what the bot actually sees
+  fs.mkdirSync(DEBUG_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(DEBUG_DIR, 'listing.png'), fullPage: true }).catch(()=>{});
+  const html = await page.content().catch(()=>'');
+  fs.writeFileSync(path.join(DEBUG_DIR, 'listing.html'), html);
+
+  // Collect cards
+  const selectors = [
     '.event-card',
-    'article',
-    'li[class*="event"]',
-    '.card',
-    '[data-component*="event"]'
+    'article[class*="event" i]',
+    'li[class*="event" i]',
+    '.card:has(a[href*="/event/"])',
+    'a[href*="/event/"], a[href*="/events/"]' // fallback
   ];
-
-  // Collect cards by trying selectors until we get a decent count
   let cards = [];
-  for (const sel of cardSelectors) {
+  for (const sel of selectors) {
     cards = await page.$$(sel);
-    if (cards.length >= 5) break; // good enough
-  }
-  if (cards.length === 0) {
-    // fallback to links; still better than nothing
-    cards = await page.$$('a[href*="/event/"], a[href*="/events/"]');
+    if (cards.length >= 5) break;
   }
 
-  const seen = new Set();
   const results = [];
+  const seen = new Set();
 
   for (const card of cards) {
-    const info = await extractFromCard(card);
+    const info = await card.evaluate(node => {
+      const t = sel => (node.querySelector(sel)?.textContent || '').replace(/\s+/g, ' ').trim();
+      const href = node.querySelector('a[href*="/event/"], a[href*="/events/"]')?.getAttribute('href') || '';
+      const title = t('h3, h2, h4, .card-title, .event-title, a[title], a');
+      const dateText = t('time, .date, .event-date, .when, [class*="date"]');
+      const status = t('.availability, .status, .badge, [class*="availability"], .label');
+      return { href, title, dateText, status };
+    });
+
     const title = clean(info.title);
-    // ignore cookie/policy junk
     if (!title || /cookie|policy|terms/i.test(title)) continue;
 
-    const start = normalizeStart(clean(info.dateText));
+    const start = normalizeStart(info.dateText);
     const status = clean(info.status);
     const override_pct = statusToPct(status);
-
     const key = `${title}|${start || ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -117,14 +131,15 @@ function normalizeStart(dateText) {
     results.push({ title, start, status, override_pct });
   }
 
-  results.sort((a, b) => {
+  results.sort((a,b) => {
     const da = a.start ? Date.parse(a.start) : Infinity;
     const db = b.start ? Date.parse(b.start) : Infinity;
     return da - db;
   });
 
-  fs.mkdirSync(path.dirname(OUT), { recursive: true });
   fs.writeFileSync(OUT, JSON.stringify(results, null, 2));
   console.log(`Wrote ${results.length} events -> ${OUT}`);
+
   await browser.close();
 })();
+
