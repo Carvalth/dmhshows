@@ -1,4 +1,4 @@
-// scrape-dmh.js — DMH listing scraper (pagination, safe selectors, robust debug)
+// scrape-dmh.js — DMH (robust) list scraper: pagination, clean anchors, full-card status scan
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
@@ -13,15 +13,22 @@ const UA =
 
 const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
+function statusFromText(txt = '') {
+  const s = txt.toLowerCase();
+  if (s.includes('sold out')) return 'SOLD OUT';
+  if (/very\s*limited|limited|last\s*(few|remaining)|almost\s*sold|low\s*availability/.test(s)) return 'LIMITED';
+  if (s.includes('selling fast') || s.includes('best availability')) return 'SELLING FAST';
+  if (s.includes('book now') || s.includes('on sale') || s.includes('available')) return 'BOOK NOW';
+  return '';
+}
 function statusToPct(label = '') {
   const s = label.toLowerCase();
-  if (/sold\s*out/.test(s)) return 100;
-  if (/(very\s*limited|limited|last\s*(few|remaining)|almost\s*sold|low\s*availability)/.test(s)) return 92;
-  if (/(selling\s*fast|best\s*availability)/.test(s)) return 70;
-  if (/(book\s*now|on\s*sale|available)/.test(s)) return 48;
+  if (s === 'sold out') return 100;
+  if (s === 'limited') return 92;
+  if (s === 'selling fast') return 70;
+  if (s === 'book now') return 48;
   return 30;
 }
-
 function normalizeStart(dateText) {
   const t = clean(dateText);
   if (!t) return null;
@@ -31,21 +38,19 @@ function normalizeStart(dateText) {
 }
 
 async function acceptCookies(page) {
-  // Cookie banner shows an "I Accept" button
-  const locators = [
+  const choices = [
     'button:has-text("I Accept")',
     'button:has-text("Accept all")',
     'button:has-text("Accept All")',
     '#onetrust-accept-btn-handler',
   ];
-  for (const sel of locators) {
-    const btn = page.locator(sel).first();
-    if (await btn.count()) { await btn.click({ timeout: 1000 }).catch(()=>{}); break; }
+  for (const sel of choices) {
+    const loc = page.locator(sel).first();
+    if (await loc.count()) { await loc.click({ timeout: 1000 }).catch(()=>{}); break; }
   }
 }
 
 async function paginatedUrls(page) {
-  // collect explicit pager links like /whats-on/page/2/
   const hrefs = await page.$$eval('a', as =>
     Array.from(new Set(as.map(a => a.href).filter(Boolean)))
       .filter(h => /\/whats-on\/page\/\d+\/?$/i.test(h))
@@ -54,47 +59,57 @@ async function paginatedUrls(page) {
 }
 
 async function extractFromListing(page) {
-  // scroll to render lazy stuff
+  // render lazy items
   for (let i = 0; i < 8; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(250);
   }
 
-  // Do all extraction in one $$eval to avoid fragile element-handle selectors
-  const rows = await page.$$eval('a[href*="/event/"], a[href*="/events/"]', as => {
-    const isJunk = t => /cookie|policy|terms/i.test(t);
-    const results = [];
+  // Grab event anchors but drop "More info about ..." and pure "BOOK NOW" CTAs.
+  const rows = await page.$$eval('a[href*="/event/"], a[href*="/events/"]', (as) => {
+    const junkAnchor = (a) => {
+      const t = (a.textContent || '').trim();
+      const titleAttr = (a.getAttribute('title') || '').trim();
+      if (/^more info$/i.test(t)) return true;
+      if (/^more info about /i.test(titleAttr)) return true;
+      return false;
+    };
 
+    // Build a unique set of card nodes we want to parse
+    const cards = new Set();
     for (const a of as) {
-      // Walk up to a plausible "card"
+      if (junkAnchor(a)) continue;
       const card = a.closest('article, li, .card, .event, .grid-item, .content, .col') || a.parentElement;
+      if (card) cards.add(card);
+    }
 
-      // Title: prefer heading inside the card; fall back to attributes; avoid "MORE INFO" text
+    const results = [];
+    cards.forEach(card => {
+      const pick = sel => (card.querySelector(sel)?.textContent || '').replace(/\s+/g,' ').trim();
+
+      // Title: headings first, then prominent link text
       let title =
-        (card?.querySelector('h2, h3, h4, .event-title, .card-title')?.textContent || '') ||
-        a.getAttribute('title') || a.getAttribute('aria-label') || a.textContent || '';
-      title = title.replace(/\s+/g, ' ').trim();
-      if (!title || isJunk(title) || /^more info$/i.test(title)) continue;
+        pick('h2, h3, h4, .event-title, .card-title') ||
+        (card.querySelector('a[href*="/event/"], a[href*="/events/"]')?.textContent || '');
 
-      // Date badge/label near image/heading
-      let dateText =
-        (card?.querySelector('time, .date, .event-date, .when, [class*="date"]')?.textContent || '')
-          .replace(/\s+/g, ' ').trim();
+      title = title.replace(/\s+/g,' ').trim();
+      if (!title || /^more info$/i.test(title)) return;
 
-      // Status: badge/label OR scan all buttons/links text inside the card
-      let status =
-        (card?.querySelector('.availability, .status, .badge, [class*="availability"], .label, .pill')?.textContent || '')
-          .replace(/\s+/g, ' ').trim();
+      // Date (badge/label)
+      const dateText = pick('time, .date, .event-date, .when, [class*="date"]');
 
-      if (!status && card) {
-        const texts = Array.from(card.querySelectorAll('a,button'))
-          .map(el => (el.textContent || '').replace(/\s+/g,' ').trim())
-          .filter(Boolean);
-        status = texts.find(t => /sold\s*out|book\s*now|limited|last\s*remaining|selling\s*fast|best\s*availability/i.test(t)) || '';
+      // STATUS: use full card text so we catch plain <span>SOLD OUT</span>
+      const full = card.innerText.replace(/\s+/g,' ').trim();
+      let status = statusFromText(full);
+
+      // If still empty, try badges/buttons quickly
+      if (!status) {
+        const badge = pick('.availability, .status, .badge, [class*="availability"], .label, .pill');
+        status = statusFromText(badge);
       }
 
       results.push({ title, dateText, status });
-    }
+    });
 
     // de-dupe by title+date
     const seen = new Set();
@@ -106,11 +121,10 @@ async function extractFromListing(page) {
     });
   });
 
-  // Map to final shape
   return rows.map(r => ({
     title: clean(r.title),
     start: normalizeStart(r.dateText),
-    status: clean(r.status),
+    status: r.status,                         // already normalized words
     override_pct: statusToPct(r.status)
   }));
 }
@@ -131,21 +145,16 @@ async function extractFromListing(page) {
   await acceptCookies(page);
 
   const urls = new Set([START_URL]);
-  try {
-    (await paginatedUrls(page)).forEach(u => urls.add(u));
-  } catch {}
+  try { (await paginatedUrls(page)).forEach(u => urls.add(u)); } catch {}
 
   const all = [];
   let idx = 0;
 
   for (const url of urls) {
     idx++;
-    if (idx > 1) {
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
-      await acceptCookies(page);
-    }
+    if (idx > 1) { await page.goto(url, { waitUntil: 'domcontentloaded' }); await acceptCookies(page); }
 
-    // Save debug per page
+    // Debug dump
     const dir = path.join(DEBUG_DIR, `page-${idx}`);
     fs.mkdirSync(dir, { recursive: true });
     await page.screenshot({ path: path.join(dir, 'listing.png'), fullPage: true }).catch(()=>{});
@@ -157,7 +166,6 @@ async function extractFromListing(page) {
     console.log(`[info] ${url} -> ${items.length} items`);
   }
 
-  // sort by date (unknown last)
   all.sort((a,b) => {
     const da = a.start ? Date.parse(a.start) : Infinity;
     const db = b.start ? Date.parse(b.start) : Infinity;
