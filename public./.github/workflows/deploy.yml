@@ -40,5 +40,5 @@ jobs:
           SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
         run: |
           # change this to your exact domain
-          DOMAIN="your-domain.surge.sh"
+          DOMAIN="dmhshows.surge.sh"
           surge ./public $DOMAIN --token $SURGE_TOKEN --project ./public
