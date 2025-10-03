@@ -11,7 +11,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      DOMAIN: dmhshows.surge.sh   # <-- change to your Surge domain
+      DOMAIN: dmhshows.surge.sh     # <-- your Surge domain
       DEPLOY_DIR: ./public
 
     steps:
@@ -39,11 +39,11 @@ jobs:
         run: npm run scrape
 
       - name: Upload debug (HTML + screenshot)
-  uses: actions/upload-artifact@v4
-  with:
-    name: listing-debug
-    path: public/debug/**    # <-- grabs all pages
-    if-no-files-found: ignore
+        uses: actions/upload-artifact@v4
+        with:
+          name: listing-debug
+          path: public/debug/**           # grabs all pages' debug files
+          if-no-files-found: ignore
 
       - name: Verify build output
         run: |
@@ -62,4 +62,3 @@ jobs:
         run: |
           echo "Deploying $DEPLOY_DIR -> https://$DOMAIN"
           npx surge "$DEPLOY_DIR" "$DOMAIN" --token "$SURGE_TOKEN"
-
