@@ -8,8 +8,8 @@ on:
     branches: [ main ]      # also run on pushes
 
 jobs:
-  build-deploy:
-    runs-on: ubuntu-latest
+  deploy:
+    npx surge ./public "$DOMAIN" --token "$SURGE_TOKEN"
 
     steps:
       - name: Checkout
