@@ -1,311 +1,380 @@
-// scrape-dmh.js — De Montfort Hall -> Ticketsolve with accurate % sold when available
-// Requires Node 18+ and playwright
+// Scraper for De Montfort Hall -> public/dmh-events.json
+// Node >=18 / Playwright >=1.47
+// package.json should have:  "type": "module",  "scripts": { "scrape": "node scrape-dmh.js" }
 
 import { chromium } from 'playwright';
 import fs from 'fs/promises';
 import path from 'path';
+import os from 'os';
 
-// --------- Config ----------
-const DMH_WHATS_ON = 'https://demontforthall.co.uk/whats-on/';
+// -------- Config --------
+const LIST_URL = 'https://demontforthall.co.uk/whats-on/';
 const OUTFILE = path.join('public', 'dmh-events.json');
 
+const PAGE_TIMEOUT = 35000;
 const NAV_WAIT = 'domcontentloaded';
-const PAGE_TIMEOUT_MS = 30_000;
+const NETWORK_IDLE = 6000;
+const SCROLL_PAUSE = 300;
 
-// --------- Utils ----------
+const TS_CONCURRENCY = 3; // Ticketsolve concurrency
+const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
+
+// -------- Utilities --------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const round = (n) => Math.round(n);
 
-function statusFallbackPct(statusText = '') {
-  const s = statusText.toLowerCase();
+const statusToPct = (status = '') => {
+  const s = status.toLowerCase();
   if (s.includes('sold')) return 100;
   if (s.includes('limited')) return 85;
-  if (s.includes('last') || s.includes('low') || s.includes('few')) return 75;
+  if (s.includes('last') || s.includes('few') || s.includes('low')) return 75;
   if (s.includes('book')) return 48;
   return 30;
-}
+};
 
-// DMH dates are typically day+month+year in text. We keep time at 19:30 local by default.
-function parseDateLoose(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/\s+/g, ' ').trim();
-  // If a <time datetime="..."> exists, prefer it (we’ll pass through as-is).
-  // Otherwise try to feed Date; add a time so UTC conversion won’t jump a day.
+const iso = (str) => {
+  if (!str) return null;
+  const d = new Date(str);
+  return isNaN(d) ? null : d.toISOString();
+};
+
+const normalizeUrl = (maybe, base) => {
   try {
-    const d = new Date(`${cleaned} 19:30`);
-    return isNaN(d) ? null : d.toISOString();
-  } catch {
-    return null;
+    if (!maybe) return '';
+    return maybe.startsWith('/') ? new URL(maybe, base).href : maybe;
+  } catch { return maybe || ''; }
+};
+
+function dedupeBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    const k = keyFn(x);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
   }
+  return out;
 }
 
-// Walk arbitrary JSON to find {capacity, remaining}-like pairs
-function extractCapacityFromJSON(obj) {
+// Find a pair of {capacity, remaining} in unknown JSON trees
+function findCapRemaining(obj) {
   if (!obj || typeof obj !== 'object') return null;
-  const stack = [obj];
+  const todo = [obj];
   const seen = new Set();
-  const found = [];
+  const candidates = [];
 
-  while (stack.length) {
-    const node = stack.pop();
+  const keyHits = (k, re) => re.test(String(k).toLowerCase());
+
+  while (todo.length) {
+    const node = todo.pop();
     if (!node || typeof node !== 'object' || seen.has(node)) continue;
     seen.add(node);
 
     const keys = Object.keys(node);
-    const lc = (k) => k.toLowerCase();
+    const capKey = keys.find(k => keyHits(k, /(^|_)(capacity|totalcapacity|max|quota|seats(total)?)(_|$)/));
+    const remKey = keys.find(k => keyHits(k, /(^|_)(remaining|available|left|free|seatsavailable|ticketsremaining)(_|$)/));
 
-    const capKey = keys.find(k => /capacity|totalcapacity|total|max|quota|seats(total)?/i.test(lc(k)));
-    const remKey = keys.find(k => /remaining|available|left|free|seatsAvailable|ticketsRemaining/i.test(lc(k)));
     if (capKey && remKey) {
-      const capacity = Number(node[capKey]);
-      const remaining = Number(node[remKey]);
-      if (Number.isFinite(capacity) && Number.isFinite(remaining) && capacity > 0 && remaining >= 0) {
-        found.push({ capacity, remaining });
+      const cap = Number(node[capKey]);
+      const rem = Number(node[remKey]);
+      if (Number.isFinite(cap) && Number.isFinite(rem) && cap > 0 && rem >= 0) {
+        candidates.push({ capacity: cap, remaining: rem });
       }
     }
 
     for (const k of keys) {
       const v = node[k];
-      if (Array.isArray(v)) v.forEach(x => (x && typeof x === 'object') && stack.push(x));
-      else if (v && typeof v === 'object') stack.push(v);
+      if (v && typeof v === 'object') {
+        if (Array.isArray(v)) v.forEach(it => it && typeof it === 'object' && todo.push(it));
+        else todo.push(v);
+      }
     }
   }
-
-  if (!found.length) return null;
-  // Prefer the largest capacity — usually the main performance, not an add-on
-  found.sort((a, b) => b.capacity - a.capacity);
-  return found[0];
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.capacity - a.capacity);
+  return candidates[0];
 }
 
-// Open a Ticketsolve page and listen for JSON/XHR to compute availability
-async function probeTicketsolveAvailability(tsPage, url) {
+async function probeTicketsolve(page, url) {
+  // Listen for JSON responses that might include inventory
   let best = null;
 
-  const handler = async (resp) => {
+  const onResponse = async (resp) => {
     try {
       const ct = resp.headers()['content-type'] || '';
-      const u = resp.url();
       if (!/json|javascript/.test(ct)) return;
-      if (!/(avail|inventory|seat|ticket|capacity|performance|event)/i.test(u)) return;
-      const body = await resp.text();
-      if (!body) return;
-      let data;
-      try { data = JSON.parse(body); } catch { return; }
-      const ex = extractCapacityFromJSON(data);
+      const u = resp.url();
+      if (!/(avail|inventory|seat|ticket|capacity|performance|event|shows)/i.test(u)) return;
+
+      const text = await resp.text();
+      if (!text) return;
+      let data; try { data = JSON.parse(text); } catch { return; }
+      const ex = findCapRemaining(data);
       if (ex && (!best || ex.capacity > best.capacity)) best = ex;
     } catch {}
   };
 
-  tsPage.on('response', handler);
+  page.on('response', onResponse);
   try {
-    await tsPage.goto(url, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT_MS });
-    // Let network settle
-    await tsPage.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await sleep(400);
+    await page.goto(url, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT });
+    // let the seatmap/app boot
+    await page.waitForLoadState('networkidle', { timeout: NETWORK_IDLE }).catch(() => {});
+    // Nudge lazy loaders
+    await page.locator('button, [role="button"]').first().click({ timeout: 1000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => {});
   } catch {} finally {
-    tsPage.off('response', handler);
+    page.off('response', onResponse);
   }
 
-  // Fallback: look for bootstrapped JSON in the DOM
+  // Fallback to scanning bootstrapped JSON present in window or script tags
   if (!best) {
     try {
-      const boot = await tsPage.evaluate(() => {
+      const dumped = await page.evaluate(() => {
         const out = {};
-        if (window.__PRELOADED_STATE__) out.preloaded = window.__PRELOADED_STATE__;
-        if (window.__INITIAL_STATE__) out.initial = window.__INITIAL_STATE__;
-        if (window.__TS_INITIAL_STATE__) out.ts = window.__TS_INITIAL_STATE__;
-        const blocks = Array.from(document.querySelectorAll('script[type="application/json"]'))
-          .map(s => { try { return JSON.parse(s.textContent || ''); } catch { return null; } })
+        const globs = [
+          '__PRELOADED_STATE__', '__INITIAL_STATE__', 'TS_BOOTSTRAP', '__TS_INITIAL_STATE__'
+        ];
+        for (const g of globs) if (window[g]) out[g] = window[g];
+        const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'))
+          .map(s => { try { return JSON.parse(s.textContent || '') } catch { return null } })
           .filter(Boolean);
-        if (blocks.length) out.blocks = blocks;
+        if (jsonScripts.length) out.scripts = jsonScripts;
         return out;
       });
-      best = extractCapacityFromJSON(boot) || extractCapacityFromJSON(boot?.blocks?.[0]);
+      best = findCapRemaining(dumped) || findCapRemaining(dumped?.scripts?.[0]);
     } catch {}
   }
 
-  if (best && best.capacity > 0) {
-    const remaining = clamp(best.remaining, 0, best.capacity);
-    const sold = best.capacity - remaining;
-    const pct = clamp(round((sold / best.capacity) * 100), 0, 100);
-    return { capacity: best.capacity, remaining, sold, pct };
-  }
-  return null;
+  if (!best) return null;
+
+  const capacity = best.capacity;
+  const remaining = clamp(best.remaining, 0, capacity);
+  const sold = capacity - remaining;
+  const pct = clamp(round((sold / capacity) * 100), 0, 100);
+  return { capacity, remaining, sold, pct };
 }
 
-// Click "Load more" repeatedly if present
-async function exhaustLoadMore(page) {
-  for (let i = 0; i < 15; i++) {
-    // Buttons we might encounter
-    const btn = page.locator('button:has-text("Load more"), a:has-text("Load more")').first();
-    const visible = await btn.isVisible().catch(() => false);
-    if (!visible) break;
-    try {
-      await btn.click({ timeout: 3000 });
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-      await sleep(400);
-    } catch {
-      break;
-    }
-  }
-}
-
-// Collect all cards into plain objects BEFORE leaving the page
-async function collectCards(page) {
-  const results = await page.evaluate(() => {
-    // Be generous with selectors — the site might tweak classes.
-    const cardSel = [
-      '.card-event',
-      '[class*="card"][class*="event"]',
-      'article:has(a)'
-    ].join(',');
-
-    const nodes = Array.from(document.querySelectorAll(cardSel));
-    const items = [];
-
-    for (const el of nodes) {
-      // Title
-      const titleEl = el.querySelector('h3 a, h3, .title a, .title');
-      const title = titleEl?.textContent?.trim() || '';
-
-      // Date: prefer <time datetime="">
-      const timeEl = el.querySelector('time[datetime]') || el.querySelector('time');
-      const datetime = timeEl?.getAttribute?.('datetime') || '';
-      const dateText = datetime || (timeEl?.textContent?.trim() || el.querySelector('.date')?.textContent?.trim() || '');
-
-      // CTA
-      const ctaEl =
-        el.querySelector('a.cta.cta--primary') ||
-        el.querySelector('a[class*="cta"][class*="primary"]') ||
-        el.querySelector('a[href*="ticketsolve"]') ||
-        el.querySelector('a');
-
-      const status = (ctaEl?.textContent || '').trim();
-      let href = ctaEl?.getAttribute('href') || '';
-
-      // Resolve relative URLs
-      try {
-        if (href && href.startsWith('/')) href = new URL(href, location.origin).href;
-      } catch {}
-
-      // Try to detect direct ticketsolve link on the card, otherwise look for a "More info" that goes to event page
-      const ticketsLink =
-        href && /ticketsolve\.com/i.test(href)
-          ? href
-          : '';
-
-      const eventPage =
-        href && !/ticketsolve\.com/i.test(href)
-          ? href
-          : '';
-
-      items.push({ title, dateText, datetime, status, ticketsLink, eventPage });
-    }
-
-    // Deduplicate by title+dateText
-    const seen = new Set();
-    return items.filter(it => {
-      const k = `${it.title}|${it.dateText}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return it.title;
-    });
-  });
-
-  return results;
-}
-
-async function maybeFindTicketsolveFromEventPage(page, eventUrl) {
-  if (!eventUrl) return '';
+// Try to extract a ticketsolve link from the event page if the card didn’t have one
+async function findTicketsolveOnEventPage(page, eventUrl) {
   try {
-    await page.goto(eventUrl, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT_MS });
-    // Look for a buy/cta button that points to ticketsolve
-    const link = await page.$('a[href*="ticketsolve"]');
-    if (link) {
-      const href = await link.getAttribute('href');
-      if (href) {
-        try {
-          return href.startsWith('/') ? new URL(href, new URL(eventUrl).origin).href : href;
-        } catch { return href; }
-      }
+    await page.goto(eventUrl, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT });
+    const a = page.locator('a[href*="ticketsolve"]');
+    if (await a.count()) {
+      const href = await a.first().getAttribute('href');
+      if (href) return normalizeUrl(href, eventUrl);
+    }
+    const btn = page.locator('[data-href*="ticketsolve"]');
+    if (await btn.count()) {
+      const href = await btn.first().getAttribute('data-href');
+      if (href) return normalizeUrl(href, eventUrl);
     }
   } catch {}
   return '';
 }
 
-// --------- Main scrape ----------
-async function scrape() {
-  const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext();
-  const listing = await ctx.newPage();
-  const tsPage = await ctx.newPage(); // dedicated Ticketsolve page (DON'T reuse listing page)
-
-  const out = [];
-
-  try {
-    await listing.goto(DMH_WHATS_ON, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT_MS });
-    await exhaustLoadMore(listing);
-    // Scroll to ensure any lazy content mounts
-    await listing.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await sleep(500);
-
-    const cards = await collectCards(listing);
-
-    // Resolve ticketsolve links for those that only have a DMH event page
-    for (const card of cards) {
-      let ticketsHref = card.ticketsLink;
-      if (!ticketsHref && card.eventPage) {
-        ticketsHref = await maybeFindTicketsolveFromEventPage(listing, card.eventPage);
-      }
-
-      // Compute start
-      // If datetime looks ISO-like, use it; else parse the visible text
-      const startISO = card.datetime
-        ? (new Date(card.datetime).toString() !== 'Invalid Date'
-            ? new Date(card.datetime).toISOString()
-            : parseDateLoose(card.dateText))
-        : parseDateLoose(card.dateText);
-
-      let override_pct = null;
-
-      // Try hard availability only if we have a ticketsolve URL
-      if (ticketsHref && /ticketsolve\.com/i.test(ticketsHref)) {
-        const seatUrl = /\/seats\b/.test(ticketsHref) ? ticketsHref : ticketsHref.replace(/\/$/, '') + '/seats';
-        const avail = await probeTicketsolveAvailability(tsPage, seatUrl);
-        if (avail?.pct != null) override_pct = avail.pct;
-      }
-
-      if (override_pct == null) {
-        override_pct = statusFallbackPct(card.status);
-      }
-
-      out.push({
-        title: card.title,
-        start: startISO,
-        status: card.status || '',
-        override_pct
-      });
-    }
-  } finally {
-    await browser.close();
+async function expandListing(page) {
+  // Some pages lazy-load on scroll. Do a short scroll loop
+  let prev = -1;
+  for (let i = 0; i < 8; i++) {
+    const h = await page.evaluate(() => document.body.scrollHeight);
+    if (h === prev) break;
+    prev = h;
+    await page.mouse.wheel(0, h);
+    await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+    await sleep(SCROLL_PAUSE);
   }
-
-  // Dedup and tidy
-  const seen = new Set();
-  const final = out.filter(ev => {
-    const key = `${ev.title}|${ev.start || ''}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return ev.title;
-  });
-
-  await fs.mkdir(path.dirname(OUTFILE), { recursive: true });
-  await fs.writeFile(OUTFILE, JSON.stringify(final, null, 2), 'utf8');
-  console.log(`Wrote ${final.length} events to ${OUTFILE}`);
 }
 
-scrape().catch(err => {
-  console.error('Scrape error:', err?.stack || err);
+// Collect cards from current page
+async function extractCardsFromPage(page) {
+  const base = page.url();
+  return await page.evaluate((baseUrl) => {
+    const getText = (el) => (el ? (el.innerText || el.textContent || '') : '').trim();
+
+    const cards = Array.from(document.querySelectorAll('.card-event, article, .card'))
+      .filter(n => n.querySelector('h3, .title, h2'));
+
+    const items = [];
+    for (const n of cards) {
+      const titleEl = n.querySelector('h3 a, h3, .title a, .title, h2 a, h2');
+      const title = getText(titleEl);
+
+      const timeEl = n.querySelector('time[datetime]') || n.querySelector('time');
+      const datetime = timeEl?.getAttribute?.('datetime') || '';
+      const dateText = datetime || getText(timeEl) || getText(n.querySelector('.date'));
+
+      const cta =
+        n.querySelector('a.cta.cta--primary, a[class*="cta"][class*="primary"], a[href*="ticketsolve"]') ||
+        n.querySelector('button, [role="button"]');
+
+      const status = getText(cta);
+
+      let href = '';
+      if (cta && 'href' in cta && cta.href) href = cta.getAttribute('href') || '';
+      if (!href) {
+        const anyA = n.querySelector('a[href]');
+        href = anyA?.getAttribute('href') || '';
+      }
+
+      const isTS = /ticketsolve\.com/i.test(href);
+      items.push({
+        title,
+        dateText,
+        datetime,
+        status,
+        ticketsLink: isTS ? href : '',
+        eventPage: isTS ? '' : href
+      });
+    }
+
+    // Normalise URLs
+    for (const it of items) {
+      if (it.ticketsLink && it.ticketsLink.startsWith('/')) {
+        it.ticketsLink = new URL(it.ticketsLink, baseUrl).href;
+      }
+      if (it.eventPage && it.eventPage.startsWith('/')) {
+        it.eventPage = new URL(it.eventPage, baseUrl).href;
+      }
+    }
+    return items.filter(it => it.title);
+  }, base);
+}
+
+// Paginate through numeric pager (1 2 3 4 ... at bottom)
+async function collectAllListingCards(context) {
+  const page = await context.newPage();
+  const results = [];
+
+  try {
+    await page.goto(LIST_URL, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT });
+    await page.waitForLoadState('networkidle', { timeout: NETWORK_IDLE }).catch(() => {});
+    await expandListing(page);
+
+    // Discover total pages from pager
+    const totalPages = await page.evaluate(() => {
+      const nums = Array.from(document.querySelectorAll('a, button'))
+        .map(el => (el.textContent || '').trim())
+        .map(t => Number(t))
+        .filter(n => Number.isFinite(n));
+      const max = nums.length ? Math.max(...nums) : 1;
+      return Math.max(1, max);
+    });
+
+    for (let p = 1; p <= totalPages; p++) {
+      if (p > 1) {
+        // Click the specific page number
+        const sel = `a:has-text("${p}")`;
+        const existed = await page.locator(sel).first().isVisible().catch(() => false);
+        if (existed) {
+          await page.locator(sel).first().click({ timeout: 4000 }).catch(() => {});
+        } else {
+          // fallback: querystring ?_page=…
+          const u = new URL(page.url());
+          u.searchParams.set('pg', String(p));
+          await page.goto(u.href, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT });
+        }
+        await page.waitForLoadState('networkidle', { timeout: NETWORK_IDLE }).catch(() => {});
+        await expandListing(page);
+      }
+
+      const cards = await extractCardsFromPage(page);
+      results.push(...cards);
+    }
+  } finally {
+    await page.close().catch(() => {});
+  }
+
+  // Dedup by title+date
+  return dedupeBy(results, it => `${it.title}|${it.dateText}|${it.datetime}`);
+}
+
+// simple pool mapper
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const running = new Set();
+  const kick = async (idx) => {
+    running.add(idx);
+    try { out[idx] = await fn(items[idx], idx); }
+    finally { running.delete(idx); }
+  };
+  while (i < items.length) {
+    while (running.size < limit && i < items.length) {
+      void kick(i++);
+    }
+    if (running.size) await Promise.race([...running].map(() => sleep(25)));
+  }
+  while (running.size) await sleep(25);
+  return out;
+}
+
+// -------- Main --------
+async function main() {
+  const browser = await chromium.launch({ headless: HEADLESS });
+  const context = await browser.newContext({
+    userAgent: `Mozilla/5.0 (${os.platform()}; ${os.arch()}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36`
+  });
+
+  try {
+    // 1) Collect all listing cards across pages
+    const cards = await collectAllListingCards(context);
+
+    // Pre-create Ticketsolve pages for concurrency
+    const tsPages = [];
+    for (let i = 0; i < TS_CONCURRENCY; i++) tsPages.push(await context.newPage());
+
+    // 2) Enrich with Ticketsolve % sold
+    const enriched = await mapLimit(cards, TS_CONCURRENCY, async (card, idx) => {
+      let ticketsUrl = card.ticketsLink;
+      const listPage = tsPages[idx % TS_CONCURRENCY];
+
+      // Resolve a Ticketsolve URL from the event page when missing
+      if (!ticketsUrl && card.eventPage) {
+        ticketsUrl = await findTicketsolveOnEventPage(listPage, card.eventPage);
+      }
+      if (ticketsUrl && !/\/seats\b/.test(ticketsUrl)) ticketsUrl = ticketsUrl.replace(/\/$/, '') + '/seats';
+
+      // Parse start datetime
+      const start =
+        (card.datetime && iso(card.datetime)) ||
+        (card.dateText && iso(card.dateText)) ||
+        null;
+
+      // Probe Ticketsolve
+      let pct = null;
+      if (ticketsUrl && /ticketsolve\.com/.test(ticketsUrl)) {
+        try {
+          const res = await probeTicketsolve(listPage, ticketsUrl);
+          if (res?.pct != null) pct = res.pct;
+        } catch {}
+      }
+      if (pct == null) pct = statusToPct(card.status);
+
+      return {
+        title: card.title,
+        start,
+        status: card.status || '',
+        override_pct: pct
+      };
+    });
+
+    // 3) Dedup and write
+    const final = dedupeBy(
+      enriched.filter(Boolean),
+      ev => `${ev.title}|${ev.start || ''}|${ev.status}`
+    );
+
+    await fs.mkdir(path.dirname(OUTFILE), { recursive: true });
+    await fs.writeFile(OUTFILE, JSON.stringify(final, null, 2), 'utf8');
+    console.log(`Wrote ${final.length} events → ${OUTFILE}`);
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+main().catch(err => {
+  console.error(err?.stack || err);
   process.exit(1);
 });
