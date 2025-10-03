@@ -1,164 +1,244 @@
-// scrape-dmh.js — robust Playwright scraper for De Montfort Hall
+// scrape-dmh.js  — Playwright-based scraper that estimates % tickets sold
 import { chromium } from 'playwright';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import dayjs from 'dayjs';
+import fs from 'fs/promises';
+import path from 'path';
 
-const WHATSON_URL = 'https://demontforthall.co.uk/whats-on/';
-const OUT_DIR = 'public';
-const OUT_JSON = path.join(OUT_DIR, 'dmh-events.json');
-const DEBUG_DIR = path.join(OUT_DIR, 'debug');
+// ---------- Config ----------
+const DMH_WHATS_ON = 'https://demontforthall.co.uk/whats-on/';
+const OUTFILE = path.join('public', 'dmh-events.json');
 
-function statusToPct(status) {
-  const s = (status || '').toUpperCase();
-  if (s.includes('SOLD OUT')) return 100;
-  if (s.includes('BOOK NOW')) return 48;
+// Timeouts / throttling
+const PAGE_TIMEOUT_MS = 30_000;
+const NAV_WAIT = 'domcontentloaded';
+
+// ---------- Helpers ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const round = (n) => Math.round(n);
+
+function statusFallbackPct(statusText = '') {
+  const s = statusText.toLowerCase();
+  if (s.includes('sold')) return 100;
+  if (s.includes('limited')) return 85;
+  if (s.includes('last') || s.includes('low') || s.includes('few')) return 75;
+  if (s.includes('book')) return 48;
   return 30;
 }
 
-function parseDateToISO(txt) {
-  const t = (txt || '').replace(/\s+/g, ' ').trim();
-  const d = dayjs(t);
-  return d.isValid() ? new Date(d.year(), d.month(), d.date()).toISOString() : null;
-}
-
-async function acceptCookies(page) {
-  const selectors = [
-    '#ccc-notify-accept',
-    '.ccc-notify-accept',
-    'button:has-text("Accept all")',
-    'button:has-text("Accept All")',
-    'button[aria-label*="Accept"][aria-label*="cookie" i]'
-  ];
-  for (const sel of selectors) {
-    const el = page.locator(sel);
-    if (await el.count().catch(() => 0)) {
-      try {
-        await el.first().click({ timeout: 2000 }).catch(() => {});
-        break;
-      } catch {}
-    }
-  }
-}
-
-async function loadAll(page) {
-  // Click a "Load more" style button until it disappears or repeats
-  for (let i = 0; i < 30; i++) {
-    const more = page.locator('button:has-text("Load more"), a:has-text("Load more")');
-    const visible = await more.isVisible().catch(() => false);
-    if (!visible) break;
-    await more.click({ timeout: 3000 }).catch(() => {});
-    // wait for new cards to be added or network to settle
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    // small guard to let DOM update
-    await page.waitForTimeout(300);
-  }
-}
-
-async function extractCard(card) {
-  let title = await card.locator('h3 a, h3 .title, h3').first().innerText().catch(() => '');
-  title = title.replace(/\s+/g, ' ').trim();
-
-  const dateText = await card.locator('.date').first().innerText().catch(() => '');
-  const start = parseDateToISO(dateText);
-
-  // CTA or badge for status
-  let status = await card.locator('a.cta.cta--primary').first().innerText().catch(() => '');
-  if (!status) {
-    status = await card
-      .locator('[class*="badge"], .status, .soldout, .sold-out, .label:has-text("SOLD")')
-      .first()
-      .innerText()
-      .catch(() => '');
-  }
-  status = (status || '').replace(/\s+/g, ' ').trim().toUpperCase();
-  if (status.includes('SOLD OUT')) status = 'SOLD OUT';
-  else if (status.includes('BOOK NOW')) status = 'BOOK NOW';
-  else status = '';
-
-  return { title, start, status, override_pct: statusToPct(status) };
-}
-
-function dedupe(items) {
-  const seen = new Set();
-  const out = [];
-  for (const e of items) {
-    const key = `${e.title}__${e.start || ''}`;
-    if (e.title && !seen.has(key)) {
-      seen.add(key);
-      out.push(e);
-    }
-  }
-  return out;
-}
-
-async function ensureDirs() {
-  await fs.mkdir(OUT_DIR, { recursive: true });
-  await fs.mkdir(DEBUG_DIR, { recursive: true });
-}
-
-async function writeDebug(page, label) {
+function parseDateUK(text) {
+  // e.g. "Mon 6 Oct 2025" or "Thu 23 Jan 2026"
+  // Let Date parse in the browser locale once we add a time so it's unambiguous.
+  // If parse fails, return null.
   try {
-    const png = path.join(DEBUG_DIR, `${label}.png`);
-    const html = path.join(DEBUG_DIR, `${label}.html`);
-    await page.screenshot({ path: png, fullPage: true }).catch(() => {});
-    const content = await page.content().catch(() => '<no content>');
-    await fs.writeFile(html, content, 'utf8').catch(() => {});
-    console.log(`Wrote debug to ${png} and ${html}`);
-  } catch {}
+    // Add 19:30 local time as a safe default so we preserve the day
+    const d = new Date(text + ' 19:30');
+    return isNaN(d) ? null : d.toISOString();
+  } catch {
+    return null;
+  }
 }
 
-async function main() {
-  await ensureDirs();
+// Try to extract capacity/remaining pairs from arbitrary JSON
+function extractCapacityFromJSON(obj) {
+  if (!obj || typeof obj !== 'object') return null;
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
-  });
-  const page = await context.newPage();
+  // common Ticketsolve-ish keys we’ve seen
+  const candidates = [];
+
+  // Walk the object shallowly & add nodes that look like availability
+  const stack = [obj];
+  const visited = new Set();
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object' || visited.has(node)) continue;
+    visited.add(node);
+
+    // Heuristic keys
+    const keys = Object.keys(node);
+    const lc = (k) => k.toLowerCase();
+
+    const hasCapacity = keys.some(k => /capacity|total|max|quota/.test(lc(k)));
+    const hasAvail   = keys.some(k => /remaining|available|left|free/.test(lc(k)));
+
+    if (hasCapacity && hasAvail) {
+      const capacity = Number(
+        node.capacity ?? node.total ?? node.max ?? node.quota ?? node.totalCapacity
+      );
+      const remaining = Number(
+        node.remaining ?? node.available ?? node.left ?? node.free ?? node.ticketsRemaining ?? node.seatsAvailable
+      );
+      if (Number.isFinite(capacity) && Number.isFinite(remaining) && capacity > 0) {
+        candidates.push({ capacity, remaining });
+      }
+    }
+
+    // push children
+    for (const k of keys) {
+      const v = node[k];
+      if (v && typeof v === 'object') stack.push(v);
+      if (Array.isArray(v)) for (const item of v) if (item && typeof item === 'object') stack.push(item);
+    }
+  }
+
+  if (candidates.length) {
+    // prefer the largest capacity (usually the main performance, not an upsell)
+    candidates.sort((a, b) => b.capacity - a.capacity);
+    return candidates[0];
+  }
+  return null;
+}
+
+// Listen for JSON/XHR while loading a Ticketsolve page and try to read capacity
+async function probeTicketsolveAvailability(page, url) {
+  let best = null;
+
+  const handler = async (resp) => {
+    try {
+      const ct = resp.headers()['content-type'] || '';
+      const u = resp.url();
+      // Heuristic: endpoints that look like availability/inventory/etc
+      if (!/json|javascript/.test(ct)) return;
+      if (!/(avail|inventory|seat|ticket|capacity|performance|event)/i.test(u)) return;
+      const bodyText = await resp.text();
+      if (!bodyText) return;
+
+      // Most responses will be JSON
+      let data;
+      try { data = JSON.parse(bodyText); }
+      catch { /* some are JS; ignore */ return; }
+
+      const extracted = extractCapacityFromJSON(data);
+      if (extracted) {
+        // Keep the one with the largest capacity
+        if (!best || extracted.capacity > best.capacity) {
+          best = extracted;
+        }
+      }
+    } catch { /* ignore single response errors */ }
+  };
+
+  page.on('response', handler);
 
   try {
-    await page.goto(WHATSON_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(url, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT_MS });
+    // Let XHRs fire
+    await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
+    await sleep(500); // small settle
+  } catch {
+    // ignore navigation errors; we’ll fall back later
+  } finally {
+    page.off('response', handler);
+  }
 
-    // handle cookies (don’t fail if not present)
-    await acceptCookies(page);
+  // As a secondary attempt, try to read any embedded JSON bootstrap state
+  if (!best) {
+    try {
+      const boot = await page.evaluate(() => {
+        // try a few common patterns
+        const out = {};
+        if (window.__PRELOADED_STATE__) out.preloaded = window.__PRELOADED_STATE__;
+        if (window.__INITIAL_STATE__) out.initial = window.__INITIAL_STATE__;
+        if (window.__TS_INITIAL_STATE__) out.ts = window.__TS_INITIAL_STATE__;
+        // pick up any lone <script type="application/json"> blocks
+        const scripts = Array.from(document.querySelectorAll('script[type="application/json"]'))
+          .map(s => {
+            try { return JSON.parse(s.textContent || ''); } catch { return null; }
+          })
+          .filter(Boolean);
+        if (scripts.length) out.embedded = scripts;
+        return out;
+      });
+      best = extractCapacityFromJSON(boot) || extractCapacityFromJSON(boot?.embedded?.[0]);
+    } catch { /* ignore */ }
+  }
 
-    // wait for any card container to appear; don’t hang forever
-    const cards = page.locator('.card-event');
-    await cards.first().waitFor({ state: 'visible', timeout: 30000 });
+  if (best && best.capacity > 0) {
+    const remaining = clamp(best.remaining, 0, best.capacity);
+    const sold = best.capacity - remaining;
+    const pct = clamp(round((sold / best.capacity) * 100), 0, 100);
+    return { capacity: best.capacity, remaining, sold, pct };
+  }
+  return null;
+}
 
-    // some sites lazy-load the rest:
-    await loadAll(page);
+// ---------- Scrape flow ----------
+async function scrape() {
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
 
-    const count = await cards.count();
-    if (count === 0) {
-      console.warn('No cards found after wait — writing debug');
-      await writeDebug(page, 'no-cards');
+  const all = [];
+
+  try {
+    await page.goto(DMH_WHATS_ON, { waitUntil: NAV_WAIT, timeout: PAGE_TIMEOUT_MS });
+    // Some sites lazy-load cards; scroll to bottom to trigger
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await sleep(800);
+
+    const cards = await page.$$('[class*="card-event"], .card-event');
+    for (const card of cards) {
+      const title = (await card.$eval('h3 a, h3, .title a, .title', el => el.textContent?.trim()).catch(() => '')) || '';
+      if (!title) continue;
+
+      const dateText = await card.$eval('.date, time', el => el.textContent?.trim()).catch(() => '');
+      const startISO = parseDateUK(dateText);
+
+      // Status and link
+      const ctaHandle = await card.$('a.cta.cta--primary, a[class*="cta-primary"], a[href*="ticketsolve"]');
+      let status = '';
+      let ctaHref = '';
+      if (ctaHandle) {
+        status = (await ctaHandle.textContent())?.trim() || '';
+        ctaHref = (await ctaHandle.getAttribute('href')) || '';
+        // Normalise relative links
+        if (ctaHref && ctaHref.startsWith('/')) {
+          const { origin } = new URL(DMH_WHATS_ON);
+          ctaHref = origin + ctaHref;
+        }
+      }
+
+      // Try to compute % sold from Ticketsolve if we have a usable link
+      let override_pct = null;
+      if (ctaHref && /ticketsolve\.com/.test(ctaHref)) {
+        const avail = await probeTicketsolveAvailability(page, ctaHref);
+        if (avail?.pct != null) {
+          override_pct = avail.pct;
+        }
+      }
+
+      // Fallback mapping if no hard numbers
+      if (override_pct == null) {
+        override_pct = statusFallbackPct(status);
+      }
+
+      all.push({
+        title,
+        start: startISO,
+        status,
+        override_pct
+      });
     }
-
-    const results = [];
-    for (let i = 0; i < count; i++) {
-      const item = await extractCard(cards.nth(i));
-      if (item.title) results.push(item);
-    }
-
-    const final = dedupe(results);
-    await fs.writeFile(OUT_JSON, JSON.stringify(final, null, 2), 'utf8');
-    console.log(`Scraped ${final.length} events`);
-    console.log(final.slice(0, 3));
-  } catch (err) {
-    console.error('Scrape error:', err?.message || err);
-    await writeDebug(page, 'error');
-    // still emit a JSON file so later steps don’t fail
-    await fs.writeFile(OUT_JSON, '[]', 'utf8');
-    process.exitCode = 1;
   } finally {
     await browser.close();
   }
+
+  // Filter obvious empties / duplicates
+  const dedup = [];
+  const seen = new Set();
+  for (const ev of all) {
+    const key = `${ev.title}|${ev.start||''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedup.push(ev);
+  }
+
+  await fs.mkdir(path.dirname(OUTFILE), { recursive: true });
+  await fs.writeFile(OUTFILE, JSON.stringify(dedup, null, 2), 'utf8');
+  console.log(`Wrote ${dedup.length} events to ${OUTFILE}`);
 }
 
-main();
+scrape().catch(err => {
+  console.error('Scrape error:', err?.message || err);
+  process.exit(1);
+});
+
