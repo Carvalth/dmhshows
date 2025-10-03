@@ -39,13 +39,11 @@ jobs:
         run: npm run scrape
 
       - name: Upload debug (HTML + screenshot)
-        uses: actions/upload-artifact@v4
-        with:
-          name: listing-debug
-          path: |
-            public/debug/listing.html
-            public/debug/listing.png
-          if-no-files-found: ignore
+  uses: actions/upload-artifact@v4
+  with:
+    name: listing-debug
+    path: public/debug/**    # <-- grabs all pages
+    if-no-files-found: ignore
 
       - name: Verify build output
         run: |
