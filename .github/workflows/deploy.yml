@@ -1,23 +1,27 @@
 name: Scrape & Deploy to Surge
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:            # manual Run button
   push:
-    branches: [ main ]
+    branches: [ main ]          # on pushes to main
   schedule:
-    - cron: "0 */6 * * *"   # every 6h UTC
+    - cron: "0 */6 * * *"       # every 6h UTC
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     env:
-      DOMAIN: dmhshows.surge.sh   # <-- your Surge domain
+      DOMAIN: dmhshows.surge.sh   # <-- change to your Surge domain
       DEPLOY_DIR: ./public
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Show repo layout
         run: |
@@ -31,23 +35,24 @@ jobs:
           npm ci || npm i
           npx playwright install --with-deps chromium
 
-          - name: Run scraper (writes public/dmh-events.json)
-      run: npm run scrape
+      - name: Run scraper (writes public/dmh-events.json)
+        run: npm run scrape
 
-    - name: Upload debug (HTML + screenshot)
-      uses: actions/upload-artifact@v4
-      with:
-        name: listing-debug
-        path: |
-          public/debug/listing.html
-          public/debug/listing.png
-        if-no-files-found: ignore
-
+      - name: Upload debug (HTML + screenshot)
+        uses: actions/upload-artifact@v4
+        with:
+          name: listing-debug
+          path: |
+            public/debug/listing.html
+            public/debug/listing.png
+          if-no-files-found: ignore
 
       - name: Verify build output
         run: |
           test -f "$DEPLOY_DIR/index.html" || (echo "::error::index.html missing in $DEPLOY_DIR" && exit 1)
-          test -f "$DEPLOY_DIR/dmh-events.json" || (echo "::warning::dmh-events.json missing; scraper may have produced no events")
+          if [ ! -f "$DEPLOY_DIR/dmh-events.json" ]; then
+            echo "::warning::dmh-events.json missing; scraper may have produced no events"
+          fi
 
       - name: Install Surge CLI
         run: npm i -g surge
@@ -59,3 +64,4 @@ jobs:
         run: |
           echo "Deploying $DEPLOY_DIR -> https://$DOMAIN"
           npx surge "$DEPLOY_DIR" "$DOMAIN" --token "$SURGE_TOKEN"
+
