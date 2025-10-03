@@ -9,7 +9,7 @@ on:
 
 jobs:
   deploy:
-    npx surge ./public "$DOMAIN" --token "$SURGE_TOKEN"
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
