@@ -13,7 +13,7 @@ jobs:
 
     env:
       DOMAIN: dmhshows.surge.sh   # <-- your Surge domain
-      DEPLOY_DIR: ./public
+      DEPLOY_DIR: ./public.
 
     steps:
       - name: Checkout
