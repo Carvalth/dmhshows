@@ -1,280 +1,385 @@
-// scrape-dmh.js
-// De Montfort Hall (What's On) → public/dmh-events.json
-// Requires: Playwright (chromium)
+#!/usr/bin/env node
+/**
+ * Demontfort Hall scraper → stdout JSON array
+ * Node 18+/20+, Puppeteer
+ *
+ * Usage:
+ *   node scrape-dmh.js
+ *
+ * Env (optional):
+ *   START_URL=https://www.demontforthall.co.uk/whats-on/
+ *   HEADLESS=true|false
+ *   MAX_PAGES=3          // how many "load more" paginations to attempt (safety)
+ *   DEBUG=true           // extra console logs
+ */
 
-import fs from "fs";
-import path from "path";
-import { chromium } from "playwright";
+const puppeteer = require('puppeteer');
 
-const ROOT = "https://www.demontforthall.co.uk";
-const LISTING_URLS = [
-  `${ROOT}/whats-on/`,
-  `${ROOT}/whats-on/page/2/`,
-  `${ROOT}/whats-on/page/3/`,
-  `${ROOT}/whats-on/page/4/`,
-  `${ROOT}/whats-on/page/5/`,
-  `${ROOT}/whats-on/page/6/`,
-  `${ROOT}/whats-on/page/7/`,
-  `${ROOT}/whats-on/page/8/`,
+const START_URL =
+  process.env.START_URL || 'https://www.demontforthall.co.uk/whats-on/';
+const HEADLESS = (process.env.HEADLESS || 'true').toLowerCase() !== 'false';
+const MAX_PAGES = parseInt(process.env.MAX_PAGES || '12', 10);
+const DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
+
+//––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// Helpers
+//––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+/** Tight bands for common scarcity labels on event / Ticketsolve pages */
+const LABEL_TO_PCT = [
+  { re: /last few|almost gone|final (seats?|tickets?)/i, pct: 92 },
+  { re: /limited/i, pct: 78 },
+  { re: /selling fast/i, pct: 66 },
+  { re: /just added|new date/i, pct: 55 },
 ];
 
-const OUT_DIR = "./public";
-const DEBUG_DIR = path.join(OUT_DIR, "debug");
-const OUT_JSON = path.join(OUT_DIR, "dmh-events.json");
-
-// ---------------- helpers
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function ensureDirs() {
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  fs.mkdirSync(DEBUG_DIR, { recursive: true });
+/** Normalise whitespace */
+function squish(str) {
+  return (str || '').replace(/\s+/g, ' ').trim();
 }
 
-function slug(s) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
+/** Parse a date string to ISO (UTC) if possible */
+function toISODateOrNull(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
 
-function statusFromText(raw) {
-  const t = (raw || "").toUpperCase().replace(/\s+/g, " ").trim();
-
-  // strong SOLD OUT indicators (venue & Ticketsolve wordings)
-  if (/\bSOLD[-\s]*OUT\b/.test(t)) return "SOLD OUT";
-  if (/\bNO TICKETS (LEFT|AVAILABLE)\b/.test(t)) return "SOLD OUT";
-  if (/\bCURRENTLY NOT ON SALE\b/.test(t)) return "SOLD OUT";
-  if (/\bFULLY BOOKED\b/.test(t)) return "SOLD OUT";
-  if (/\bUNAVAILABLE\b/.test(t)) return "SOLD OUT";
-
-  // other states we may care about
-  if (/\bON SALE SOON\b/.test(t)) return "ON SALE SOON";
-  if (/\bLIMITED\b/.test(t)) return "LIMITED";
-
-  if (/\bBOOK\s*NOW\b/.test(t)) return "BOOK NOW";
-  return "";
+/** Basic “status from CTA text” as a last resort */
+function statusFromText(txt) {
+  const t = (txt || '').toLowerCase();
+  if (/\bsold\s*out\b/.test(t)) return 'SOLD OUT';
+  if (/\bcancelled|canceled|postponed|rescheduled/.test(t)) return 'CANCELLED';
+  if (/book|tickets?/.test(t)) return 'BOOK NOW';
+  return '';
 }
 
-function overridePct(status) {
-  if (status === "SOLD OUT") return 100;
-  if (status === "BOOK NOW") return 48;
-  return 30; // unknown / generic
-}
-
-const MONTHS = {
-  JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
-  JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11,
-};
-
-function parseDate(text) {
-  // Examples seen on site: "Mon 6 Oct 2025"
-  // We'll grab "6 Oct 2025"
-  const m = (text || "").match(/(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/);
-  if (!m) return null;
-  const day = parseInt(m[1], 10);
-  const mon = m[2].slice(0, 3).toUpperCase();
-  const year = parseInt(m[3], 10);
-  const monthIdx = MONTHS[mon];
-  if (Number.isNaN(day) || Number.isNaN(year) || monthIdx == null) return null;
-  return new Date(Date.UTC(year, monthIdx, day));
-}
-
-// ---------------- Ticketsolve checker (robust)
-
-async function getTicketsolveStatus(context, url, dbg = { save: false, title: "" }) {
-  const page = await context.newPage();
+/** Robustly get absolute URL */
+function absolutize(base, href) {
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    // Give the page a moment to hydrate
-    await sleep(600);
-
-    // 1) scan visible CTA/button/link text
-    const ctaText = await page.$$eval("a,button", (els) =>
-      els
-        .filter((e) => {
-          const s = getComputedStyle(e);
-          return s && s.display !== "none" && s.visibility !== "hidden";
-        })
-        .map((e) => (e.innerText || e.textContent || "").trim())
-        .join("\n")
-    );
-    let status = statusFromText(ctaText);
-    if (status) return status;
-
-    // 2) fall back to overall visible text
-    const bodyText = await page.evaluate(() => document.body.innerText || "");
-    status = statusFromText(bodyText);
-    if (status) return status;
-
-    // 3) disabled buttons = treat as sold out
-    const disabled = await page.$(
-      'button[disabled], .btn[disabled], .button[disabled], [aria-disabled="true"]'
-    );
-    if (disabled) return "SOLD OUT";
-
-    // 4) attributes sometimes carry it
-    const attrVals = await page.$$eval(
-      "[aria-label],[data-status],[data-availability]",
-      (els) =>
-        els.map(
-          (e) =>
-            e.getAttribute("aria-label") ||
-            e.getAttribute("data-status") ||
-            e.getAttribute("data-availability") ||
-            ""
-        )
-    );
-    for (const a of attrVals) {
-      const s = statusFromText(a);
-      if (s) return s;
-    }
-
-    // Debug-dump if we couldn't classify
-    if (dbg.save) {
-      const html = await page.content();
-      const file = path.join(
-        DEBUG_DIR,
-        `ticketsolve-${slug(dbg.title || url)}.html`
-      );
-      await fs.promises.writeFile(file, html);
-      console.log(`[debug] saved ${file}`);
-    }
-
-    // Default if nothing screamed otherwise
-    return "BOOK NOW";
-  } catch (err) {
-    console.warn(`[warn] ticketsolve check failed for ${url}: ${err.message}`);
-    return "";
-  } finally {
-    await page.close();
+    return new URL(href, base).toString();
+  } catch {
+    return null;
   }
 }
 
-// ---------------- Listing extraction
+/** Dedupe events by (title, start) */
+function dedupe(events) {
+  const seen = new Set();
+  const out = [];
+  for (const e of events) {
+    const key = `${e.title}__${e.start || ''}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(e);
+    }
+  }
+  return out;
+}
 
-async function extractFromListing(page, context, url) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+/** Ticketsolve refinement for status + percentage */
+async function refineStatusFromTicketsolve(page, tsUrl) {
+  try {
+    await page.goto(tsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  // Save the raw listing for debugging
-  const listingHtml = await page.content();
-  const listingFile = path.join(DEBUG_DIR, `listing-${slug(url)}.html`);
-  await fs.promises.writeFile(listingFile, listingHtml).catch(() => {});
-  console.log(`[info] ${url} -> listing saved`);
+    // 1) Heavyweight check: SOLD OUT / CANCELLED / etc
+    const html = await page.content();
+    const pageText = html.toLowerCase();
 
-  // The cards appear as <div class="card-event"> ... </div>
-  const cards = await page.$$("div.card-event");
-  console.log(`[info] ${url} -> ${cards.length} cards`);
+    if (/\bsold\s*out\b|no\s*tickets\s*available|allocation\s*exhausted/i.test(pageText)) {
+      return { status: 'SOLD OUT', override_pct: 100, via: 'sold-out-text' };
+    }
+    if (/\bcancelled|canceled|postponed|rescheduled/i.test(pageText)) {
+      return { status: 'CANCELLED', override_pct: 0, via: 'cancel-text' };
+    }
 
-  const events = [];
+    // 2) aria-valuenow on a progressbar (most accurate when present)
+    const ariaNow = await page
+      .$eval('[role="progressbar"][aria-valuenow]', el =>
+        parseFloat(el.getAttribute('aria-valuenow'))
+      )
+      .catch(() => null);
 
-  for (const el of cards) {
-    try {
-      // Pull the basics inside the browser context
-      const card = await el.evaluate((root) => {
-        const getText = (sel) =>
-          (root.querySelector(sel)?.innerText || "").trim();
+    if (Number.isFinite(ariaNow)) {
+      const pct = Math.max(0, Math.min(100, ariaNow));
+      return {
+        status: pct >= 100 ? 'SOLD OUT' : 'BOOK NOW',
+        override_pct: pct,
+        via: 'aria-progress',
+      };
+    }
 
-        const title =
-          (root.querySelector("h3.title a")?.textContent ||
-            root.querySelector("h3.title")?.textContent ||
-            "").trim();
+    // 3) style width % (e.g., style="width: 73%")
+    const styleWidth = await page
+      .$eval(
+        '[role="progressbar"], .progress-bar, .tickets-progress, .availability-progress',
+        el => {
+          const s = el.getAttribute('style') || '';
+          const m = s.match(/width\s*:\s*([0-9.]+)%/i);
+          return m ? parseFloat(m[1]) : null;
+        }
+      )
+      .catch(() => null);
 
-        const dateText = getText("span.date");
+    if (Number.isFinite(styleWidth)) {
+      const pct = Math.max(0, Math.min(100, styleWidth));
+      return {
+        status: pct >= 100 ? 'SOLD OUT' : 'BOOK NOW',
+        override_pct: pct,
+        via: 'style-width',
+      };
+    }
 
-        // CTA anchor (usually Ticketsolve) + all text inside the card
-        const cta = root.querySelector('a.cta.cta-primary, a[aria-label*="BOOK"]');
-        const ctaHref = cta?.getAttribute("href") || "";
-        const cardText = (root.innerText || "").trim();
+    // 4) Scarcity label → banded % (keeps numbers realistic)
+    for (const { re, pct } of LABEL_TO_PCT) {
+      if (re.test(pageText)) {
+        return { status: 'BOOK NOW', override_pct: pct, via: 'label-map' };
+      }
+    }
 
-        return { title, dateText, ctaHref, cardText };
-      });
+    // 5) Default if the page is plainly bookable
+    return { status: 'BOOK NOW', override_pct: 48, via: 'default' };
+  } catch (err) {
+    if (DEBUG) console.error('Ticketsolve refine error:', tsUrl, err?.message || err);
+    // On failure, return a conservative default (still bookable)
+    return { status: 'BOOK NOW', override_pct: 48, via: 'error-fallback' };
+  }
+}
 
-      if (!card.title) continue;
-
-      // Normalize date
-      const startDate = parseDate(card.dateText);
-      const startISO = startDate ? startDate.toISOString() : null;
-
-      // Initial status from card text
-      let status = statusFromText(card.cardText);
-
-      // If the card didn't reveal status and we have a Ticketsolve link,
-      // go check the live availability there.
-      let absoluteHref = card.ctaHref;
-      if (absoluteHref && absoluteHref.startsWith("/")) {
-        absoluteHref = `${ROOT}${absoluteHref}`;
+/** Scrape the listing (card grid) and return event stubs */
+async function extractCardsOnPage(page, baseUrl) {
+  // We try to accommodate common WordPress + custom card markup patterns.
+  // If the site changes, these selectors are easy to tune.
+  return await page.$$eval(
+    [
+      // articles/cards
+      'article, .card, .c-card, .event-card, .listing-item',
+    ].join(','),
+    (cards, baseUrl) => {
+      function squish(s) {
+        return (s || '').replace(/\s+/g, ' ').trim();
+      }
+      function absolutize(href) {
+        try {
+          return new URL(href, baseUrl).toString();
+        } catch {
+          return null;
+        }
+      }
+      function getDateFromCard(card) {
+        // Try multiple patterns: <time datetime>, date text, data-attrs, etc.
+        const timeEl = card.querySelector('time[datetime]') || card.querySelector('time');
+        const attr = timeEl?.getAttribute('datetime') || '';
+        const raw = squish(timeEl?.textContent || attr || '');
+        return raw || null;
+      }
+      function statusFromText(txt) {
+        const t = (txt || '').toLowerCase();
+        if (/\bsold\s*out\b/.test(t)) return 'SOLD OUT';
+        if (/\bcancelled|canceled|postponed|rescheduled/.test(t)) return 'CANCELLED';
+        if (/book|tickets?/.test(t)) return 'BOOK NOW';
+        return '';
       }
 
-      if (!status && absoluteHref && /ticketsolve\.com/i.test(absoluteHref)) {
-        status = await getTicketsolveStatus(context, absoluteHref, {
-          save: true,
-          title: card.title,
+      const items = [];
+      for (const card of cards) {
+        // A title – usually in <h2>/<h3> within the card
+        const titleEl =
+          card.querySelector('h2, h3, .card-title, .c-card__title, .event-title') ||
+          card.querySelector('a[aria-label], a[title]');
+        let title = squish(titleEl?.textContent || '');
+
+        // Fallback: sometimes the only visible text is an anchor inside the card
+        if (!title) {
+          const a = card.querySelector('a');
+          title = squish(a?.textContent || '');
+        }
+
+        // Skip empty cards
+        if (!title) continue;
+
+        // Skip obvious noise rows (we’ll also filter later)
+        if (/^\s*(more info|book now)\s*$/i.test(title)) continue;
+
+        // CTA (button/link) for quick status
+        const cta =
+          card.querySelector('a[role="button"], button, .btn, .button, a.btn') ||
+          card.querySelector('a');
+
+        const ctaText = squish(cta?.textContent || '');
+        const provisionalStatus = statusFromText(ctaText);
+
+        // Event link (prefer CTA if it looks like a booking link)
+        const href =
+          cta?.getAttribute('href') ||
+          card.querySelector('a')?.getAttribute('href') ||
+          null;
+        const absoluteHref = href ? absolutize(href) : null;
+
+        // Date
+        const rawDate = getDateFromCard(card);
+        items.push({
+          title,
+          rawDate,
+          href: absoluteHref,
+          provisionalStatus,
         });
       }
-
-      // Final fallback if we have a CTA but still empty
-      if (!status && absoluteHref) status = "BOOK NOW";
-
-      events.push({
-        title: card.title,
-        start: startISO,
-        status,
-        override_pct: overridePct(status),
-      });
-    } catch (err) {
-      console.warn(`[warn] failed on ${url} card: ${err.message}`);
-    }
-  }
-
-  return events;
+      return items;
+    },
+    baseUrl
+  );
 }
 
-// ---------------- main
+/** Try clicking “Load more” or walking pagination (best-effort, safe to no-op) */
+async function paginate(page) {
+  let pages = 0;
+  while (pages < MAX_PAGES) {
+    const clicked = await page.evaluate(() => {
+      // Common “Load more” patterns
+      const btn =
+        document.querySelector('button.load-more, .load-more button, a.load-more, .c-load-more button') ||
+        Array.from(document.querySelectorAll('button, a'))
+          .find(
+            el =>
+              /load more|show more|more events|more results/i.test(el.textContent || '') &&
+              !el.hasAttribute('disabled')
+          );
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      // Pagination “Next”
+      const next =
+        document.querySelector('a[rel="next"]') ||
+        Array.from(document.querySelectorAll('a')).find(a =>
+          /next|older/i.test(a.textContent || '')
+        );
+      if (next) {
+        next.click();
+        return true;
+      }
+      return false;
+    });
 
-(async () => {
-  ensureDirs();
+    if (!clicked) break;
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
-  });
-
-  const context = await browser.newContext({
-    // DMH has a cookie banner; dumping it is enough for our purposes
-    viewport: { width: 1440, height: 900 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-  });
-
-  const page = await context.newPage();
-
-  const allEvents = [];
-  for (const url of LISTING_URLS) {
+    pages += 1;
     try {
-      const events = await extractFromListing(page, context, url);
-      allEvents.push(...events);
-    } catch (err) {
-      console.warn(`[warn] listing failed ${url}: ${err.message}`);
+      // Wait for new cards (or at least a small delay if DOM doesn’t change)
+      await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(600);
+    } catch (_) {}
+  }
+}
+
+/** Main flow */
+(async () => {
+  const browser = await puppeteer.launch({
+    headless: HEADLESS,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    defaultViewport: { width: 1280, height: 1600 },
+  });
+
+  const page = await browser.newPage();
+  page.setDefaultTimeout(30000);
+
+  const results = [];
+
+  try {
+    if (DEBUG) console.error('Navigating to', START_URL);
+    await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
+
+    // Give JS-driven card grids time to render
+    await page.waitForTimeout(900);
+
+    // Try to expand more items
+    await paginate(page);
+
+    // Extract cards on the (possibly expanded) listing
+    const stubs = await extractCardsOnPage(page, START_URL);
+
+    if (DEBUG) console.error(`Found ${stubs.length} raw cards`);
+
+    // Process each card → final event object
+    for (const stub of stubs) {
+      let { title, rawDate, href, provisionalStatus } = stub;
+
+      // Filter out noisy titles
+      if (/^\s*(more info|book now)\s*$/i.test(title)) continue;
+
+      // Drop “Featured event - X” prefix, keep the event name
+      title = title.replace(/^\s*featured event\s*[-:]\s*/i, '').trim();
+
+      // Derive start ISO
+      let start = toISODateOrNull(rawDate);
+
+      // If the title looks like a date-less “DICK WHITTINGTON” + listing page only,
+      // we’ll keep start = null (your downstream can group/expand later)
+
+      // Decide status/percentage
+      let status = '';
+      let override_pct = 30; // neutral placeholder (visually dim)
+      const hrefLower = (href || '').toLowerCase();
+
+      // If the card already says SOLD OUT in CTA or badge, honour it
+      if (provisionalStatus === 'SOLD OUT') {
+        status = 'SOLD OUT';
+        override_pct = 100;
+      } else if (provisionalStatus === 'CANCELLED') {
+        status = 'CANCELLED';
+        override_pct = 0;
+      } else if (href && /ticketsolve\.com/.test(hrefLower)) {
+        // Ticketsolve refinement (most accurate)
+        const { status: s, override_pct: p } = await refineStatusFromTicketsolve(page, href);
+        status = s;
+        override_pct = p;
+      } else if (provisionalStatus === 'BOOK NOW') {
+        status = 'BOOK NOW';
+        override_pct = 48;
+      }
+
+      // Guarantee a non-empty status
+      if (!status) {
+        status = 'BOOK NOW';
+        override_pct = 48;
+      }
+
+      results.push({
+        title,
+        start,
+        status,
+        override_pct,
+      });
     }
+  } catch (err) {
+    console.error('Scrape error:', err?.stack || err?.message || err);
+  } finally {
+    await browser.close();
   }
 
-  // Basic de-dupe by (title + start)
-  const seen = new Set();
-  const unique = [];
-  for (const e of allEvents) {
-    const key = `${e.title}|${e.start || "null"}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(e);
-  }
+  // Deduplicate and clean
+  let clean = results
+    .filter(e => e && e.title) // sanity
+    .map(e => ({
+      title: e.title,
+      start: e.start || null,
+      status: e.status || 'BOOK NOW',
+      override_pct: Number.isFinite(e.override_pct) ? e.override_pct : 48,
+    }));
 
-  await fs.promises.writeFile(OUT_JSON, JSON.stringify(unique, null, 2), "utf8");
-  console.log(`Wrote ${unique.length} events -> ${OUT_JSON}`);
+  clean = dedupe(clean);
 
-  await browser.close();
-})().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+  // Optional: sort by start (nulls last), then title
+  clean.sort((a, b) => {
+    if (a.start && b.start) return a.start.localeCompare(b.start) || a.title.localeCompare(b.title);
+    if (a.start && !b.start) return -1;
+    if (!a.start && b.start) return 1;
+    return a.title.localeCompare(b.title);
+  });
+
+  // Emit JSON to stdout
+  process.stdout.write(JSON.stringify(clean, null, 2));
+})();
+
