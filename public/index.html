@@ -96,7 +96,7 @@
           <hr style="border:0;border-top:1px solid #24273a;margin:14px 0;opacity:.7" />
           <details>
             <summary><strong>Paste/Import data</strong> (JSON)</summary>
-            <textarea id="jsonInput" placeholder='[{"title":"Example","start":"2025-10-18","status":"BOOK NOW"}]'></textarea>
+            <textarea id="jsonInput" placeholder='[{"title":"Example","start":"2025-10-18","status":"BOOK NOW","override_pct":48}]'></textarea>
             <div class="controls" style="margin-top:8px">
               <button id="importBtn">Import</button>
               <button id="resetBtn" title="Restore sample data">Reset sample</button>
@@ -107,7 +107,9 @@
       </section>
     </div>
 
-    <p class="footer"><strong>Data note:</strong> De Montfort Hall does not publish exact tickets-sold figures. This page estimates busyness from the event status shown on their site (e.g., “SOLD OUT”, “BOOK NOW”).</p>
+    <p class="footer"><strong>Data note:</strong> Percentages reflect estimated
+    <em>tickets sold</em>. When exact numbers aren’t available from the box office,
+    we fall back to an approximate status-based estimate.</p>
   </main>
 
   <script>
@@ -115,18 +117,25 @@
     const fmtShort = new Intl.DateTimeFormat(undefined,{month:'short',day:'2-digit'});
     const fmtTime = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit'});
 
-    function occupancy(ev){
+    // ==== CHANGED: use override_pct when available ====
+    function pctSold(ev){
+      const n = Number(ev.override_pct);
+      if (Number.isFinite(n)) return clamp(n, 0, 100);
+
+      // fallback to legacy status→% mapping
       const s=(ev.status||'').toLowerCase();
-      if(s.includes('sold')) return 1.0;
-      if(s.includes('limited')) return 0.85;
-      if(s.includes('last')||s.includes('low')) return 0.75;
-      if(s.includes('book now')) return 0.45;
-      return 0.30;
+      if(s.includes('sold')) return 100;
+      if(s.includes('limited')) return 85;
+      if(s.includes('last')||s.includes('low')) return 75;
+      if(s.includes('book now')) return 48;
+      return 30;
     }
+    function clamp(v, a, b){ return Math.max(a, Math.min(b, Math.round(v))); }
+
     function parseDate(d){ return d? new Date(d):null; }
     function toLocalKey(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
 
-    const SAMPLE=[{title:"Level 42",start:"2025-10-06T19:00:00",status:"SOLD OUT"}];
+    const SAMPLE=[{title:"Level 42",start:"2025-10-06T19:00:00",status:"SOLD OUT",override_pct:100}];
     let state={events:[...SAMPLE],month:new Date(new Date().getFullYear(),new Date().getMonth(),1)};
 
     const monthPicker=document.getElementById('monthPicker');
@@ -149,21 +158,28 @@
       while(cells.length%7!==0) cells.push(null);
       return cells;
     }
+
+    // ==== CHANGED: store daily arrays of % sold (0–100) ====
     function buildDayScores(events){
       const map=new Map();
       for(const ev of events){
+        if(!ev.start) continue;
         const d=new Date(ev.start);
         const key=toLocalKey(d);
-        map.set(key,(map.get(key)||[]).concat(occupancy(ev)));
+        const pct=pctSold(ev);
+        map.set(key,(map.get(key)||[]).concat(pct));
       }
       return map;
     }
+
+    // ==== CHANGED: color thresholds now use % sold ====
     function getColor(pct){
-      if(pct>=0.99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
-      if(pct>=0.75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
-      if(pct>=0.40) return getComputedStyle(document.documentElement).getPropertyValue('--moderate');
+      if(pct>=99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
+      if(pct>=75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
+      if(pct>=40) return getComputedStyle(document.documentElement).getPropertyValue('--moderate');
       return getComputedStyle(document.documentElement).getPropertyValue('--quiet');
     }
+
     function renderCalendar(){
       calendar.innerHTML='';
       const days=monthMatrix(state.month);
@@ -174,35 +190,65 @@
         const cell=document.createElement('div');cell.className='day';
         if(d){
           const key=toLocalKey(d);
-          const occs=dayOccs.get(key)||[];
-          const avgOcc=occs.length?occs.reduce((a,b)=>a+b,0)/occs.length:0;
+          const arr=dayOccs.get(key)||[];
+          const avgPct=arr.length?Math.round(arr.reduce((a,b)=>a+b,0)/arr.length):0;
+
           const dateEl=document.createElement('div');dateEl.className='date';dateEl.textContent=fmtShort.format(d);
-          const pct=Math.round(avgOcc*100);
-          const bar=document.createElement('div');bar.className='bar';bar.style.background=`linear-gradient(90deg, ${getColor(avgOcc)} ${pct}%, #253136 ${pct}%)`;
-          const tag=document.createElement('span');tag.className='tag';tag.textContent=`${Math.round(avgOcc*100)}% load${occs.length?' · '+occs.length+' show'+(occs.length>1?'s':''):''}`;
+          const bar=document.createElement('div');bar.className='bar';
+          bar.style.background=`linear-gradient(90deg, ${getColor(avgPct)} ${avgPct}%, #253136 ${avgPct}%)`;
+
+          const tag=document.createElement('span');tag.className='tag';
+          tag.textContent=`${avgPct}% sold${arr.length?' · '+arr.length+' show'+(arr.length>1?'s':''):''}`;
+
           cell.appendChild(dateEl);cell.appendChild(bar);cell.appendChild(tag);
-        }else cell.style.visibility='hidden';
+        }else{
+          cell.style.visibility='hidden';
+        }
         calendar.appendChild(cell);
       }
     }
+
     function renderEvents(){
       eventsEl.innerHTML='';
+      const sortSel = document.getElementById('sortSelect');
       const arr=[...state.events];
-      arr.sort((a,b)=>new Date(a.start)-new Date(b.start));
+
+      if (sortSel.value === 'busyness') {
+        arr.sort((a,b)=>pctSold(b)-pctSold(a) || new Date(a.start)-new Date(b.start));
+      } else if (sortSel.value === 'title') {
+        arr.sort((a,b)=>(a.title||'').localeCompare(b.title||''));
+      } else {
+        arr.sort((a,b)=>new Date(a.start)-new Date(b.start));
+      }
+
       for(const ev of arr){
         const wrap=document.createElement('div');wrap.className='event';
         const left=document.createElement('div');const right=document.createElement('div');
-        const title=document.createElement('div');title.className='title';title.textContent=ev.title;
+        const title=document.createElement('div');title.className='title';title.textContent=ev.title||'';
         const dt=parseDate(ev.start);
-        const when=document.createElement('div');when.className='meta';when.textContent=fmt.format(dt);
-        const pill=document.createElement('span');pill.className='pill';pill.textContent=ev.status||'';
-        left.appendChild(title);left.appendChild(when);right.appendChild(pill);
-        wrap.appendChild(left);wrap.appendChild(right);eventsEl.appendChild(wrap);
+        const when=document.createElement('div');when.className='meta';when.textContent=dt?fmt.format(dt):'';
+
+        const pill=document.createElement('span');pill.className='pill';
+        pill.textContent=ev.status||'';
+
+        // show % sold next to status
+        const pct = pctSold(ev);
+        const pctEl=document.createElement('span');pctEl.className='pill';
+        pctEl.style.marginLeft='6px';
+        pctEl.textContent=`${pct}% sold`;
+
+        left.appendChild(title);left.appendChild(when);
+        right.appendChild(pill); right.appendChild(pctEl);
+
+        wrap.appendChild(left);wrap.appendChild(right);
+        eventsEl.appendChild(wrap);
       }
     }
+
     function renderAll(){setMonthInput(state.month);renderCalendar();renderEvents();}
     document.getElementById('prevBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()-1,1);renderAll();};
     document.getElementById('nextBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()+1,1);renderAll();};
+    document.getElementById('sortSelect').onchange=renderAll;
     monthPicker.onchange=e=>{const[y,m]=e.target.value.split('-').map(Number);state.month=new Date(y,m-1,1);renderAll();};
     document.getElementById('importBtn').onclick=()=>{try{const arr=JSON.parse(document.getElementById('jsonInput').value);if(!Array.isArray(arr))throw new Error('Must be array');state.events=arr;renderAll();}catch(err){alert(err.message)}};
     document.getElementById('resetBtn').onclick=()=>{state.events=[...SAMPLE];renderAll();};
@@ -211,10 +257,15 @@
   </script>
   <script>
     async function loadEventsFrom(url){
-      const res=await fetch(url,{cache:'no-store'});const data=await res.json();
-      state.events=data;renderAll();
+      try{
+        const res=await fetch(url,{cache:'no-store'});
+        if(!res.ok) return;
+        const data=await res.json();
+        state.events=data;renderAll();
+      }catch(e){ /* ignore */ }
     }
     loadEventsFrom('/dmh-events.json');
   </script>
 </body>
 </html>
+
