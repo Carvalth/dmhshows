@@ -1,4 +1,4 @@
-// scrape-dmh.js — DMH listing-only scraper with pagination + robust selectors + debug
+// scrape-dmh.js — DMH listing-only scraper with pagination + safe selectors (no :has-text)
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
@@ -25,77 +25,77 @@ function statusToPct(label = '') {
 function normalizeStart(dateText) {
   const t = clean(dateText);
   if (!t) return null;
-  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t;          // already ISO-ish
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t;
   const parsed = Date.parse(t);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
 async function acceptCookies(page) {
-  // DMH shows a custom banner with "I Accept"
+  // DMH has an "I Accept" button on the bottom-left cookie panel
   const candidates = [
-    'button:has-text("I Accept")',
+    'button:has-text("I Accept")',           // Playwright locator (outside evaluate)
     'button:has-text("Accept all")',
     'button:has-text("Accept All")',
-    '#onetrust-accept-btn-handler',
+    '#onetrust-accept-btn-handler'
   ];
   for (const sel of candidates) {
-    const btn = await page.$(sel).catch(() => null);
-    if (btn) { await btn.click().catch(()=>{}); break; }
+    const btn = await page.locator(sel).first();
+    if (await btn.count()) { await btn.click({ timeout: 1000 }).catch(()=>{}); break; }
   }
 }
 
+async function getPaginationHrefs(page) {
+  // Collect explicit paginated URLs like /whats-on/page/2/
+  const hrefs = await page.$$eval('a', as =>
+    Array.from(new Set(as.map(a => a.href).filter(Boolean)))
+      .filter(h => /\/whats-on\/page\/\d+\/?$/i.test(h))
+  );
+  return [START_URL, ...hrefs].filter((v,i,arr)=>arr.indexOf(v)===i);
+}
+
 async function extractCardsOnPage(page) {
-  // Scroll a bit to ensure lazy content appears
+  // Scroll to render lazy content
   for (let i = 0; i < 6; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(300);
   }
 
-  // Try a few common wrappers; if none, we’ll fall back to finding buttons and walking up
-  const wrappers = [
-    '.event-card',                          // guess
-    'article',                              // often used
-    'li[class*="event" i]',
-    '.card:has(a[href*="/event/"])'
-  ];
+  // Likely wrappers
+  const wrappers = ['.event-card','article','li[class*="event" i]','.card'];
   let nodes = [];
   for (const sel of wrappers) {
-    nodes = await page.$$(sel);
-    if (nodes.length >= 4) break;          // good enough
+    const list = await page.$$(sel);
+    if (list.length) { nodes = list; break; }
   }
-  if (nodes.length === 0) {
-    // Fallback: any element containing booking buttons/labels, then climb to a card-like ancestor
-    const btnNodes = await page.$$(
-      'a:has-text("BOOK NOW"), a:has-text("SOLD OUT"), button:has-text("BOOK NOW"), button:has-text("SOLD OUT")'
-    );
-    nodes = [];
-    for (const b of btnNodes) {
-      const card = await b.evaluateHandle(el =>
-        el.closest('article, li, .card, .event, .grid-item, .content, .col') || el.parentElement
-      );
-      nodes.push(card);
-    }
+  if (!nodes.length) {
+    // fallback: any element that contains a link to /event/
+    nodes = await page.$$('a[href*="/event/"], a[href*="/events/"]');
   }
 
   const items = [];
   for (const node of nodes) {
-    const info = await node.evaluate((n) => {
-      const txt = (sel) => (n.querySelector(sel)?.textContent || '').replace(/\s+/g,' ').trim();
-      // title candidates
+    const info = await node.evaluate(n => {
+      const pick = sel => (n.querySelector(sel)?.textContent || '').replace(/\s+/g,' ').trim();
+
+      // Title candidates
       const title =
-        txt('h2') || txt('h3') || txt('h4') ||
-        txt('.event-title, .card-title, a[title]') ||
-        // sometimes link text itself is the title:
+        pick('h2') || pick('h3') || pick('h4') ||
+        pick('.event-title, .card-title, a[title]') ||
         (n.querySelector('a[href*="/event/"], a[href*="/events/"]')?.textContent || '').replace(/\s+/g,' ').trim();
 
-      // date text (badge/label)
-      const dateText = txt('time, .date, .event-date, .when, [class*="date"]');
+      // Date (badge/label near the image)
+      const dateText = pick('time, .date, .event-date, .when, [class*="date"]');
 
-      // status from badges/buttons inside the card
-      const status =
-        txt('.availability, .status, .badge, [class*="availability"], .label, .pill') ||
-        txt('a:has-text("SOLD OUT"), button:has-text("SOLD OUT")') ||
-        txt('a:has-text("BOOK NOW"),  button:has-text("BOOK NOW")');
+      // Status: read badges first; if empty, scan all buttons/links text
+      let status =
+        pick('.availability, .status, .badge, [class*="availability"], .label, .pill');
+
+      if (!status) {
+        const texts = Array.from(n.querySelectorAll('a,button'))
+          .map(el => (el.textContent || '').replace(/\s+/g,' ').trim())
+          .filter(Boolean);
+        status = texts.find(t => /sold\s*out|book\s*now|limited|last\s*remaining|selling\s*fast/i.test(t)) || '';
+      }
 
       return { title, dateText, status };
     });
@@ -110,32 +110,14 @@ async function extractCardsOnPage(page) {
     items.push({ title, start, status, override_pct });
   }
 
-  // dedupe
+  // Dedupe by title+date
   const seen = new Set();
-  const deduped = [];
-  for (const it of items) {
+  return items.filter(it => {
     const key = `${it.title}|${it.start || ''}`;
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return false;
     seen.add(key);
-    deduped.push(it);
-  }
-  return deduped;
-}
-
-async function getPaginationHrefs(page) {
-  // collect all page links (1..8 etc)
-  const hrefs = await page.$$eval('a', as =>
-    Array.from(new Set(
-      as.map(a => a.href).filter(Boolean).filter(u => /whats-on/i.test(u))
-    ))
-  );
-  // Prefer explicit page numbers from a pager if present
-  const pager = await page.$$eval(
-    'nav, .pagination, .pager, .wp-pagenavi, .page-numbers',
-    els => els.map(el => el.innerText)
-  ).catch(() => []);
-  // If we can’t detect pager, just return START_URL only (page 1)
-  return [START_URL, ...hrefs.filter(h => /\b[?&]paged=\d+|\/page\/\d+\b/i.test(h))].filter((v,i,arr)=>arr.indexOf(v)===i);
+    return true;
+  });
 }
 
 (async () => {
@@ -151,11 +133,12 @@ async function getPaginationHrefs(page) {
   });
 
   const page = await context.newPage();
-
   const pagesToVisit = new Set([START_URL]);
+
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await acceptCookies(page);
-  // discover additional paginated pages (if any)
+
+  // discover pagination
   try {
     const hrefs = await getPaginationHrefs(page);
     hrefs.forEach(h => pagesToVisit.add(h));
@@ -172,11 +155,9 @@ async function getPaginationHrefs(page) {
         await acceptCookies(page);
       }
 
-      // screenshot + html per page for debugging
-      const pageSlug = `page-${idx}`;
-      const dir = path.join(DEBUG_DIR, pageSlug);
+      // Debug dump per page
+      const dir = path.join(DEBUG_DIR, `page-${idx}`);
       fs.mkdirSync(dir, { recursive: true });
-
       await page.screenshot({ path: path.join(dir, 'listing.png'), fullPage: true }).catch(()=>{});
       const html = await page.content().catch(()=> '');
       fs.writeFileSync(path.join(dir, 'listing.html'), html);
@@ -189,16 +170,16 @@ async function getPaginationHrefs(page) {
     }
   }
 
-  // sort by date (unknowns last)
+  // Sort by date (unknown last)
   results.sort((a,b) => {
     const da = a.start ? Date.parse(a.start) : Infinity;
     const db = b.start ? Date.parse(b.start) : Infinity;
     return da - db;
   });
 
-  // safe write (don’t wipe existing file if we found nothing)
+  // Safe write
   if (results.length === 0 && fs.existsSync(OUT)) {
-    console.warn('[warn] zero results; preserving previous dmh-events.json');
+    console.warn('[warn] zero results; preserving previous JSON');
   } else {
     fs.mkdirSync(path.dirname(OUT), { recursive: true });
     fs.writeFileSync(OUT, JSON.stringify(results, null, 2));
