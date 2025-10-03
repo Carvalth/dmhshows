@@ -36,8 +36,8 @@ jobs:
 
       - name: Deploy to Surge
         env:
-          SURGE_LOGIN: ${{ secrets.SURGE_LOGIN }}
-          SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
+          SURGE_LOGIN: ${{ secrets.callumvarle@gmail.com }}
+          SURGE_TOKEN: ${{ secrets.bc666cf5caf6954dc7b6de403b4c52f7}}
         run: |
           # change this to your exact domain
           DOMAIN="your-domain.surge.sh"
