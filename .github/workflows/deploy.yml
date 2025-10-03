@@ -31,16 +31,18 @@ jobs:
           npm ci || npm i
           npx playwright install --with-deps chromium
 
-      - name: Run scraper (writes public/dmh-events.json)
-        - name: Upload debug (HTML + screenshot)
-          uses: actions/upload-artifact@v4
-         with:
-            name: listing-debug
-            path: |
-      public/debug/listing.html
-      public/debug/listing.png
-    if-no-files-found: ignore    
-        run: npm run scrape
+          - name: Run scraper (writes public/dmh-events.json)
+      run: npm run scrape
+
+    - name: Upload debug (HTML + screenshot)
+      uses: actions/upload-artifact@v4
+      with:
+        name: listing-debug
+        path: |
+          public/debug/listing.html
+          public/debug/listing.png
+        if-no-files-found: ignore
+
 
       - name: Verify build output
         run: |
