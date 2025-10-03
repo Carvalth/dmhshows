@@ -11,7 +11,7 @@ jobs:
 
     env:
       DOMAIN: dmhshows.surge.sh     # <-- put YOUR Surge domain
-      DEPLOY_DIR: ./public          # <-- use ./ if index.html is at repo root
+      DEPLOY_DIR: ./public.          # <-- use ./ if index.html is at repo root
 
     steps:
       - name: Checkout
