@@ -3,21 +3,13 @@ import { chromium } from "playwright";
 import fs from "fs";
 
 const START_URL = "https://www.demontforthall.co.uk/whats-on/";
-const MAX_PAGES = 10; // change if they ever add more
+const MAX_PAGES = 10;
 
 async function extractFromListing(page) {
-  // Scroll a bit to trigger lazy loading
-  for (let i = 0; i < 8; i++) {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(250);
-  }
-
   const rows = await page.$$eval(
-    'a[href*="/event/"], a[href*="/events/"]',
-    (as) => {
-      // ---- Everything below runs IN THE BROWSER ----
+    'article, li, .card, .event, .grid-item, .content, .col',
+    (cards) => {
       const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-
       function statusFromText(txt = "") {
         const s = txt.toLowerCase();
         if (s.includes("sold out")) return "SOLD OUT";
@@ -27,54 +19,41 @@ async function extractFromListing(page) {
         return "";
       }
 
-      const junkAnchor = (a) => {
-        const t = (a.textContent || "").trim();
-        const titleAttr = (a.getAttribute("title") || "").trim();
-        return /^more info$/i.test(t) || /^more info about /i.test(titleAttr);
-      };
+      return cards
+        .map((card) => {
+          const title =
+            clean(
+              card.querySelector("h2,h3,h4,.event-title,.card-title")?.textContent
+            ) ||
+            clean(
+              card.querySelector('a[href*="/event/"],a[href*="/events/"]')
+                ?.textContent
+            );
+          if (!title || /^more info$/i.test(title)) return null;
 
-      const cards = new Set();
-      for (const a of as) {
-        if (junkAnchor(a)) continue;
-        const card =
-          a.closest("article, li, .card, .event, .grid-item, .content, .col") ||
-          a.parentElement;
-        if (card) cards.add(card);
-      }
+          const dateText =
+            clean(
+              card.querySelector(
+                "time,.date,.event-date,.when,[class*='date']"
+              )?.textContent
+            ) || "";
 
-      const results = [];
-      cards.forEach((card) => {
-        const pick = (sel) =>
-          (card.querySelector(sel)?.textContent || "").replace(/\s+/g, " ").trim();
+          const full = clean(card.innerText || "");
+          let status = statusFromText(full);
 
-        let title =
-          pick("h2, h3, h4, .event-title, .card-title") ||
-          (card.querySelector('a[href*="/event/"], a[href*="/events/"]')
-            ?.textContent || "");
+          // Also check any button/anchor inside the card specifically
+          if (!status) {
+            const btn = clean(
+              card.querySelector(
+                "a,button,.buy-btn,.cta,[class*='book']"
+              )?.textContent
+            );
+            if (btn) status = statusFromText(btn);
+          }
 
-        title = clean(title);
-        if (!title || /^more info$/i.test(title)) return;
-
-        const dateText = pick("time, .date, .event-date, .when, [class*='date']");
-
-        // Look at full text for status
-        const full = clean(card.innerText || "");
-        let status = statusFromText(full);
-        if (!status) {
-          const badge = pick(".availability, .status, .badge, [class*='availability'], .label, .pill");
-          status = statusFromText(badge);
-        }
-
-        results.push({ title, dateText, status });
-      });
-
-      const seen = new Set();
-      return results.filter((r) => {
-        const key = `${r.title}|${r.dateText}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
+          return { title, dateText, status };
+        })
+        .filter(Boolean);
     }
   );
 
@@ -95,7 +74,7 @@ async function extractFromListing(page) {
       if (s === "selling fast") return 70;
       if (s === "book now") return 48;
       return 30;
-    })()
+    })(),
   }));
 }
 
@@ -103,17 +82,18 @@ async function run() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
 
-  const allEvents = [];
+  const events = [];
 
   for (let i = 1; i <= MAX_PAGES; i++) {
     const url = i === 1 ? START_URL : `${START_URL}page/${i}/`;
     console.log(`[info] ${url}`);
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-      const events = await extractFromListing(page);
-      console.log(`   -> ${events.length} cards`);
-      if (!events.length && i > 1) break; // stop if no more events on deeper pages
-      allEvents.push(...events);
+      await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+      await page.waitForTimeout(1000); // small extra wait so text swaps in
+      const items = await extractFromListing(page);
+      console.log(`   -> ${items.length} cards`);
+      if (!items.length && i > 1) break;
+      events.push(...items);
     } catch (err) {
       console.warn(`[warn] failed on ${url}`, err.message);
     }
@@ -121,17 +101,13 @@ async function run() {
 
   await browser.close();
 
-  const outDir = "./public";
-  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-
-  fs.writeFileSync(
-    `${outDir}/dmh-events.json`,
-    JSON.stringify(allEvents, null, 2)
-  );
-  console.log(`Wrote ${allEvents.length} events -> ${outDir}/dmh-events.json`);
+  if (!fs.existsSync("./public")) fs.mkdirSync("./public", { recursive: true });
+  fs.writeFileSync("./public/dmh-events.json", JSON.stringify(events, null, 2));
+  console.log(`Wrote ${events.length} events -> public/dmh-events.json`);
 }
 
 run().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
