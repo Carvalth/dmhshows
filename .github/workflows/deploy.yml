@@ -1,37 +1,41 @@
-name: Scrape & Deploy to Surge
+name: Deploy to Surge
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
-  workflow_dispatch:        # allow manual run from the Actions tab
+  workflow_dispatch:        # Run button
   push:
-    branches: [ main ]      # also run on pushes
+    branches: [ main ]      # Deploy on pushes to main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    env:
+      DOMAIN: dmhshows.surge.sh     # <-- put YOUR Surge domain
+      DEPLOY_DIR: ./public          # <-- use ./ if index.html is at repo root
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install deps (Playwright + Chromium)
+      - name: Show repo layout (diagnostic)
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          echo "PWD = $PWD"
+          ls -la
+          echo "---- $DEPLOY_DIR ----"
+          ls -la "$DEPLOY_DIR" || true
 
-      - name: Scrape DMH
-        run: npm run scrape
+      - name: Verify site folder exists
+        run: |
+          if [ ! -d "$DEPLOY_DIR" ]; then
+            echo "::error::DEPLOY_DIR $DEPLOY_DIR not found. Set DEPLOY_DIR=./ or create public/"
+            exit 1
+          fi
+          if [ ! -f "$DEPLOY_DIR/index.html" ]; then
+            echo "::error::No index.html in $DEPLOY_DIR"
+            exit 1
+          fi
 
-      - name: List output
-        run: ls -la public && head -n 25 public/dmh-events.json || true
-
-      - name: Install Surge
+      - name: Install Surge CLI
         run: npm i -g surge
 
       - name: Deploy to Surge
@@ -39,6 +43,5 @@ jobs:
           SURGE_LOGIN: ${{ secrets.SURGE_LOGIN }}
           SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
         run: |
-          # change this to your exact domain
-          DOMAIN="dmhshows.surge.sh"
-          surge ./public. $DOMAIN --token $SURGE_TOKEN --project ./public
+          echo "Deploying $DEPLOY_DIR -> https://$DOMAIN"
+          npx surge "$DEPLOY_DIR" "$DOMAIN" --token "$SURGE_TOKEN"
