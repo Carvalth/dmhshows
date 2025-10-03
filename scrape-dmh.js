@@ -1,271 +1,115 @@
-#!/usr/bin/env node
-// scrape-dmh.js (ESM)
-// Node 18+/20+, Puppeteer
+// scrape-dmh.js  — Playwright (ESM) scraper for De Montfort Hall
+import { chromium } from 'playwright';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import dayjs from 'dayjs';
 
-import puppeteer from 'puppeteer';
+const WHATSON_URL = 'https://demontforthall.co.uk/whats-on/';
 
-// –– Config ––
-const START_URL =
-  process.env.START_URL || 'https://www.demontforthall.co.uk/whats-on/';
-const HEADLESS = (process.env.HEADLESS || 'true').toLowerCase() !== 'false';
-const MAX_PAGES = parseInt(process.env.MAX_PAGES || '12', 10);
-const DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
+function statusToPct(status) {
+  const s = (status || '').trim().toUpperCase();
+  if (s.includes('SOLD OUT')) return 100;
+  if (s.includes('BOOK NOW')) return 48;
+  return 30;
+}
 
-// –– Helpers ––
-const LABEL_TO_PCT = [
-  { re: /last few|almost gone|final (seats?|tickets?)/i, pct: 92 },
-  { re: /limited/i, pct: 78 },
-  { re: /selling fast/i, pct: 66 },
-  { re: /just added|new date/i, pct: 55 },
-];
+function parseDateToISO(dateText) {
+  // Site examples look like: "Mon 6 Oct 2025"
+  // dayjs can parse this in most locales; if it fails, return null.
+  const cleaned = (dateText || '').replace(/\s+/g, ' ').trim();
+  const d = dayjs(cleaned);
+  return d.isValid() ? new Date(d.year(), d.month(), d.date()).toISOString() : null;
+}
 
-const squish = (s) => (s || '').replace(/\s+/g, ' ').trim();
+async function extractCard(card) {
+  // title
+  let title = await card.locator('h3 .title, h3 a, h3').first().innerText().catch(() => '');
+  title = title.replace(/\s+/g, ' ').trim();
 
-const toISODateOrNull = (s) => {
-  if (!s) return null;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-};
+  // date
+  const dateText = await card.locator('.date').first().innerText().catch(() => '');
+  const start = parseDateToISO(dateText);
 
-const statusFromText = (txt) => {
-  const t = (txt || '').toLowerCase();
-  if (/\bsold\s*out\b/.test(t)) return 'SOLD OUT';
-  if (/\bcancelled|canceled|postponed|rescheduled/.test(t)) return 'CANCELLED';
-  if (/book|tickets?/.test(t)) return 'BOOK NOW';
-  return '';
-};
-
-const absolutize = (base, href) => {
-  try {
-    return new URL(href, base).toString();
-  } catch {
-    return null;
+  // status
+  // Primary CTA shows "BOOK NOW"; some items show "SOLD OUT" on a badge
+  let status = await card.locator('a.cta.cta--primary').first().innerText().catch(() => '');
+  if (!status) {
+    // try badges or alt labels
+    status = await card.locator('[class*="badge"], .status, .soldout, .sold-out').first().innerText().catch(() => '');
   }
-};
+  status = (status || '').replace(/\s+/g, ' ').trim().toUpperCase();
 
-const dedupe = (events) => {
+  // Sometimes the link text is uppercase by CSS; keep consistent phrasing
+  if (status.includes('SOLD OUT')) status = 'SOLD OUT';
+  else if (status.includes('BOOK NOW')) status = 'BOOK NOW';
+  else status = '';
+
+  return {
+    title,
+    start,
+    status,
+    override_pct: statusToPct(status)
+  };
+}
+
+function dedupe(events) {
   const seen = new Set();
   const out = [];
   for (const e of events) {
     const key = `${e.title}__${e.start || ''}`;
-    if (!seen.has(key)) {
+    if (e.title && !seen.has(key)) {
       seen.add(key);
       out.push(e);
     }
   }
   return out;
-};
-
-async function refineStatusFromTicketsolve(page, tsUrl) {
-  try {
-    await page.goto(tsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    const html = await page.content();
-    const pageText = html.toLowerCase();
-
-    if (/\bsold\s*out\b|no\s*tickets\s*available|allocation\s*exhausted/i.test(pageText)) {
-      return { status: 'SOLD OUT', override_pct: 100, via: 'sold-out-text' };
-    }
-    if (/\bcancelled|canceled|postponed|rescheduled/i.test(pageText)) {
-      return { status: 'CANCELLED', override_pct: 0, via: 'cancel-text' };
-    }
-
-    const ariaNow = await page
-      .$eval('[role="progressbar"][aria-valuenow]', el =>
-        parseFloat(el.getAttribute('aria-valuenow'))
-      )
-      .catch(() => null);
-
-    if (Number.isFinite(ariaNow)) {
-      const pct = Math.max(0, Math.min(100, ariaNow));
-      return { status: pct >= 100 ? 'SOLD OUT' : 'BOOK NOW', override_pct: pct, via: 'aria-progress' };
-    }
-
-    const styleWidth = await page
-      .$eval(
-        '[role="progressbar"], .progress-bar, .tickets-progress, .availability-progress',
-        el => {
-          const s = el.getAttribute('style') || '';
-          const m = s.match(/width\s*:\s*([0-9.]+)%/i);
-          return m ? parseFloat(m[1]) : null;
-        }
-      )
-      .catch(() => null);
-
-    if (Number.isFinite(styleWidth)) {
-      const pct = Math.max(0, Math.min(100, styleWidth));
-      return { status: pct >= 100 ? 'SOLD OUT' : 'BOOK NOW', override_pct: pct, via: 'style-width' };
-    }
-
-    for (const { re, pct } of LABEL_TO_PCT) {
-      if (re.test(pageText)) return { status: 'BOOK NOW', override_pct: pct, via: 'label-map' };
-    }
-
-    return { status: 'BOOK NOW', override_pct: 48, via: 'default' };
-  } catch (err) {
-    if (DEBUG) console.error('Ticketsolve refine error:', tsUrl, err?.message || err);
-    return { status: 'BOOK NOW', override_pct: 48, via: 'error-fallback' };
-  }
-}
-
-async function extractCardsOnPage(page, baseUrl) {
-  return await page.$$eval(
-    'article, .card, .c-card, .event-card, .listing-item',
-    (cards, baseUrl) => {
-      const squish = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const absolutize = (href) => {
-        try { return new URL(href, baseUrl).toString(); } catch { return null; }
-      };
-      const statusFromText = (txt) => {
-        const t = (txt || '').toLowerCase();
-        if (/\bsold\s*out\b/.test(t)) return 'SOLD OUT';
-        if (/\bcancelled|canceled|postponed|rescheduled/.test(t)) return 'CANCELLED';
-        if (/book|tickets?/.test(t)) return 'BOOK NOW';
-        return '';
-      };
-      const getDateFromCard = (card) => {
-        const t = card.querySelector('time[datetime]') || card.querySelector('time');
-        const attr = t?.getAttribute('datetime') || '';
-        const raw = squish(t?.textContent || attr || '');
-        return raw || null;
-      };
-
-      const items = [];
-      for (const card of cards) {
-        const titleEl =
-          card.querySelector('h2, h3, .card-title, .c-card__title, .event-title') ||
-          card.querySelector('a[aria-label], a[title]');
-        let title = squish(titleEl?.textContent || '');
-        if (!title) title = squish(card.querySelector('a')?.textContent || '');
-        if (!title) continue;
-        if (/^\s*(more info|book now)\s*$/i.test(title)) continue;
-
-        const cta =
-          card.querySelector('a[role="button"], button, .btn, .button, a.btn') ||
-          card.querySelector('a');
-        const ctaText = squish(cta?.textContent || '');
-        const provisionalStatus = statusFromText(ctaText);
-
-        const href =
-          cta?.getAttribute('href') ||
-          card.querySelector('a')?.getAttribute('href') ||
-          null;
-
-        items.push({
-          title,
-          rawDate: getDateFromCard(card),
-          href: href ? absolutize(href) : null,
-          provisionalStatus,
-        });
-      }
-      return items;
-    },
-    baseUrl
-  );
-}
-
-async function paginate(page) {
-  let pages = 0;
-  while (pages < MAX_PAGES) {
-    const clicked = await page.evaluate(() => {
-      const btn =
-        document.querySelector('button.load-more, .load-more button, a.load-more, .c-load-more button') ||
-        Array.from(document.querySelectorAll('button, a')).find(
-          el => /load more|show more|more events|more results/i.test(el.textContent || '') &&
-                !el.hasAttribute('disabled')
-        );
-      if (btn) { btn.click(); return true; }
-
-      const next =
-        document.querySelector('a[rel="next"]') ||
-        Array.from(document.querySelectorAll('a')).find(a => /next|older/i.test(a.textContent || ''));
-      if (next) { next.click(); return true; }
-
-      return false;
-    });
-
-    if (!clicked) break;
-    pages += 1;
-    await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(600);
-  }
 }
 
 async function main() {
-  const browser = await puppeteer.launch({
-    headless: HEADLESS,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    defaultViewport: { width: 1280, height: 1600 },
-  });
-
+  const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
-  page.setDefaultTimeout(30000);
-
-  const results = [];
 
   try {
-    if (DEBUG) console.error('Navigating to', START_URL);
-    await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(900);
-    await paginate(page);
+    await page.goto(WHATSON_URL, { waitUntil: 'networkidle' });
 
-    const stubs = await extractCardsOnPage(page, START_URL);
-    if (DEBUG) console.error(`Found ${stubs.length} raw cards`);
+    // Wait for at least one card to render
+    const cardsRoot = page.locator('.card-event');
+    await cardsRoot.first().waitFor({ state: 'visible', timeout: 30000 });
 
-    for (const stub of stubs) {
-      let { title, rawDate, href, provisionalStatus } = stub;
+    const count = await cardsRoot.count();
+    const results = [];
 
-      if (/^\s*(more info|book now)\s*$/i.test(title)) continue;
-      title = title.replace(/^\s*featured event\s*[-:]\s*/i, '').trim();
-      const start = toISODateOrNull(rawDate);
+    for (let i = 0; i < count; i++) {
+      const card = cardsRoot.nth(i);
+      const item = await extractCard(card);
 
-      let status = '';
-      let override_pct = 30;
-
-      if (provisionalStatus === 'SOLD OUT') {
-        status = 'SOLD OUT'; override_pct = 100;
-      } else if (provisionalStatus === 'CANCELLED') {
-        status = 'CANCELLED'; override_pct = 0;
-      } else if (href && /ticketsolve\.com/.test((href || '').toLowerCase())) {
-        const { status: s, override_pct: p } = await refineStatusFromTicketsolve(page, href);
-        status = s; override_pct = p;
-      } else if (provisionalStatus === 'BOOK NOW') {
-        status = 'BOOK NOW'; override_pct = 48;
-      }
-
-      if (!status) { status = 'BOOK NOW'; override_pct = 48; }
-
-      results.push({ title, start, status, override_pct });
+      // Ignore empty shells
+      if (item.title) results.push(item);
     }
+
+    const cleaned = dedupe(results);
+
+    // Ensure output folder exists
+    const outDir = path.join('public');
+    await fs.mkdir(outDir, { recursive: true });
+
+    const outFile = path.join(outDir, 'dmh-events.json');
+    await fs.writeFile(outFile, JSON.stringify(cleaned, null, 2), 'utf8');
+
+    console.log(`Scraped ${cleaned.length} events`);
+    // Print a tiny preview for CI logs
+    console.log(cleaned.slice(0, 3));
   } catch (err) {
-    console.error('Scrape error:', err?.stack || err?.message || err);
+    console.error('Scrape error:', err);
+    // Write empty array so downstream steps don't explode
+    const outDir = path.join('public');
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(path.join(outDir, 'dmh-events.json'), '[]', 'utf8');
+    process.exitCode = 1;
   } finally {
     await browser.close();
   }
-
-  let clean = results
-    .filter(e => e && e.title)
-    .map(e => ({
-      title: e.title,
-      start: e.start || null,
-      status: e.status || 'BOOK NOW',
-      override_pct: Number.isFinite(e.override_pct) ? e.override_pct : 48,
-    }));
-
-  clean = dedupe(clean);
-
-  clean.sort((a, b) => {
-    if (a.start && b.start) return a.start.localeCompare(b.start) || a.title.localeCompare(b.title);
-    if (a.start && !b.start) return -1;
-    if (!a.start && b.start) return 1;
-    return a.title.localeCompare(b.title);
-  });
-
-  process.stdout.write(JSON.stringify(clean, null, 2));
 }
 
-// ESM entrypoint
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main();
+
