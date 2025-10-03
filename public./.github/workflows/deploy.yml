@@ -41,4 +41,4 @@ jobs:
         run: |
           # change this to your exact domain
           DOMAIN="dmhshows.surge.sh"
-          surge ./public $DOMAIN --token $SURGE_TOKEN --project ./public
+          surge ./public. $DOMAIN --token $SURGE_TOKEN --project ./public
