@@ -1,257 +1,220 @@
-// scrape-dmh.js (ESM)
-// Scrapes De Montfort Hall "What's On", follows each BOOK NOW link to Ticketsolve,
-// opens the seat map zone, counts seats and computes sold_pct.
-// Writes JSON to public/dmh-events.json
+// Run with: npm run scrape
+// Writes: public/dmh-events.json
 
 import { chromium } from 'playwright';
 import fs from 'fs/promises';
 import path from 'path';
 
-const ROOT = 'https://www.demontforthall.co.uk/whats-on/';
-const OUTPUT = path.join('public', 'dmh-events.json');
+const ROOT = process.cwd();
+const OUT_PATH = path.join(ROOT, 'public', 'dmh-events.json');
+const LIST_URL = 'https://www.demontforthall.co.uk/whats-on/';
 
-// ---- Helpers ---------------------------------------------------------------
+// How many "page numbers" to attempt (stop early when a page has no cards)
+const MAX_PAGES = 12;
 
-function statusHeuristicToPct(statusText) {
+// Fallback mapping when we cannot see a seat map
+function fallbackPct(statusText) {
   const s = (statusText || '').toLowerCase();
   if (s.includes('sold')) return 100;
   if (s.includes('limited')) return 85;
   if (s.includes('last') || s.includes('low')) return 75;
-  if (s.includes('book')) return 48;
+  if (s.includes('book now')) return 48;
   return 30;
 }
 
-function parseDateFromCardText(txt) {
-  // examples on cards: "FRI 17 OCT 2025" 
-  // We try to feed it straight to Date; if it fails we leave start null
+// Robust seat counting inside Ticketsolve
+async function computePctSoldFromTicketsolve(page) {
+  // If there is a “Select a zone” control, pick the first entry that contains
+  // “Stalls and Circles”, otherwise select the first option in the listbox.
   try {
-    // Add a time to avoid TZ midnight shifts
-    const d = new Date(`${txt} 20:00`);
-    return isNaN(d.getTime()) ? null : d.toISOString();
-  } catch {
-    return null;
-  }
-}
+    const zoneToggle = await page.waitForSelector('text=/^Select a zone|Stalls and Circles$/', { timeout: 5000 });
+    await zoneToggle.click().catch(() => {});
+    // Try most-complete zone first
+    const prefer = await page.$('text="Stalls and Circles"');
+    if (prefer) {
+      await prefer.click();
+    } else {
+      // fall back to the first option in the dropdown listbox
+      const first = await page.$('[role="listbox"] [role="option"], .select__menu div[role="option"]');
+      if (first) await first.click();
+    }
+  } catch { /* zone picker may not exist (unreserved/standing) */ }
 
-async function paginateCards(page) {
-  const all = [];
-  while (true) {
-    // wait cards
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForSelector('.card-event, .card', { timeout: 15000 }).catch(()=>{});
+  // Wait for an SVG map (Ticketsolve renders an SVG with lots of <circle>/<rect>)
+  // Then count elements marked as available/unavailable.
+  await page.waitForTimeout(800); // small render pause
 
-    const cards = await page.$$eval('.card-event, .card', nodes => {
-      const items = [];
-      for (const n of nodes) {
-        const title = (n.querySelector('h3, .title, .card .title')?.textContent || '').trim();
-        const date = (n.querySelector('.date')?.textContent || '').trim();
-        const statusBtn = n.querySelector('a.cta.cta-primary, a[aria-label*="BOOK"], a.cta-primary');
-        const moreInfo = n.querySelector('a[href*="/event/"], a[href*="/events/"], a[href*="/event/"]');
-        // Prefer the explicit BOOK NOW button; fallback to "more info"
-        const bookHref = statusBtn?.getAttribute('href') || moreInfo?.getAttribute('href') || '';
-        const btnText = (statusBtn?.textContent || '').trim().toUpperCase();
-        items.push({ title, date, bookHref, btnText });
-      }
-      return items.filter(i => i.title && i.bookHref);
-    });
+  const counts = await page.evaluate(() => {
+    const getAll = (sel) => Array.from(document.querySelectorAll(sel));
 
-    all.push(...cards);
+    // Common patterns seen on Ticketsolve maps
+    const byAttr = getAll('[data-seat-status]');
+    let available = 0;
+    let unavailable = 0;
 
-    // next page?
-    const next = await page.$('a.page-numbers.next, a[rel="next"], .pagination a[aria-label="Next"]');
-    if (!next) break;
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-      next.click()
-    ]);
-  }
-  return all;
-}
-
-// Try to normalize a DMH relative URL to absolute
-function toAbsoluteUrl(href) {
-  if (!href) return null;
-  if (href.startsWith('http')) return href;
-  if (href.startsWith('/')) return new URL(href, 'https://www.demontforthall.co.uk').href;
-  return href;
-}
-
-// On a Ticketsolve event page, select a zone and count seats.
-async function computeSeatSoldPctOnTicketsolve(page) {
-  // 1) Some DMH "BOOK NOW" buttons go straight to ticketsolve seat map.
-  // 2) Others go to an intermediate "Select a zone" page.
-  // We try to select first option and then wait for the SVG seats.
-
-  // Open the zone dropdown if present and choose the first enabled option
-  const zoneSelect = await page.$('button:has-text("Select a zone"), [aria-haspopup="listbox"], select');
-  if (zoneSelect) {
-    try {
-      // If it's a native <select>
-      if ((await zoneSelect.evaluate(n => n.tagName)).toLowerCase() === 'select') {
-        const options = await page.$$eval('select option', opts =>
-          opts
-            .filter(o => !o.disabled && o.value)
-            .map(o => ({ value: o.value, label: o.textContent.trim() }))
-        );
-        if (options.length) {
-          await page.selectOption('select', options[0].value);
+    if (byAttr.length) {
+      for (const el of byAttr) {
+        const st = (el.getAttribute('data-seat-status') || '').toLowerCase();
+        if (st.includes('available')) available++;
+        else if (st.includes('unavailable') || st.includes('in_cart') || st.includes('reserved') || st.includes('held')) {
+          unavailable++;
         }
-      } else {
-        // Custom menu button
-        await zoneSelect.click();
-        const first = await page.waitForSelector(
-          'div[role="listbox"] [role="option"]:not([aria-disabled="true"]), [role="menuitem"]:not([aria-disabled="true"])',
-          { timeout: 4000 }
-        );
-        if (first) await first.click();
       }
-    } catch {
-      // ignore; some events don’t have zones
+    } else {
+      // Class name fallbacks (Ticketsolve themes vary)
+      const availNodes = getAll('.seat--available, .available.seat, .seat.available');
+      const unavailNodes = getAll('.seat--unavailable, .unavailable.seat, .seat.unavailable, .seat.in-cart, .seat.selected');
+      available = availNodes.length;
+      unavailable = unavailNodes.length;
     }
-  }
 
-  // Wait for a seat map to appear (best-effort)
-  // Seatsolve maps are usually an <svg> with many circles.
-  await page.waitForTimeout(800); // brief settle
-  const svg = await page.waitForSelector('svg', { timeout: 6000 }).catch(() => null);
-  if (!svg) return null; // no map visible
-
-  // Evaluate in page: count seats by status using multiple fallbacks.
-  const result = await page.evaluate(() => {
-    // Helper to count nodes matching any of the selectors
-    const countBySelectors = (selectors) => {
-      for (const sel of selectors) {
-        const nodes = document.querySelectorAll(sel);
-        if (nodes && nodes.length > 0) return nodes.length;
-      }
-      return 0;
-    };
-
-    // 1) Unavailable / sold seats (pink or grey depending on skin)
-    const unavailableSelectors = [
-      'svg .cts-seat--unavailable',
-      'svg [data-status="unavailable"]',
-      'svg [data-state="unavailable"]',
-      'svg [class*="unavailable"]',
-      'svg [class*="Sold"], svg [data-sold="true"]'
-    ];
-    const unavailable = countBySelectors(unavailableSelectors);
-
-    // 2) All seats (we’ll exclude unavailable for available)
-    const totalSelectors = [
-      'svg .cts-seat',                // common
-      'svg [data-seat]',             // sometimes used
-      'svg circle[data-id]',         // very generic fallback
-      'svg g[class*="seat"] circle', // theme variant
-    ];
-    let total = countBySelectors(totalSelectors);
-
-    // If we couldn’t find a total, try to infer by combining unavailable + available:
-    if (!total) {
-      const availableSelectors = [
-        'svg .cts-seat--available',
-        'svg [data-status="available"]',
-        'svg [data-state="available"]',
-        'svg [class*="available"]'
-      ];
-      const available = countBySelectors(availableSelectors);
-      if (available + unavailable > 0) {
-        total = available + unavailable;
+    // Some layouts render cursor “dots” as <circle> without attributes, but set
+    // aria-labels. Add a last-resort pass:
+    if (available + unavailable === 0) {
+      const aria = getAll('[aria-label]');
+      for (const el of aria) {
+        const lab = el.getAttribute('aria-label')?.toLowerCase() || '';
+        if (lab.includes('available')) available++;
+        else if (lab.includes('unavailable') || lab.includes('in cart') || lab.includes('reserved')) unavailable++;
       }
     }
 
-    if (!total) return null; // nothing reliable found
-
-    const soldPct = Math.round((unavailable / total) * 100);
-    return { unavailable, total, soldPct };
+    return { available, unavailable };
   });
 
-  if (!result || !result.total) return null;
-  return Math.max(0, Math.min(100, result.soldPct));
+  const total = counts.available + counts.unavailable;
+  if (total === 0) return null; // No map / not a reserved-seat show
+
+  const pctSold = Math.round((counts.unavailable / total) * 100);
+  return Math.max(0, Math.min(100, pctSold));
 }
 
-// Extract ticketsolve link from an event card on DMH site
-function extractBookNowHref(rawHref) {
-  const abs = toAbsoluteUrl(rawHref);
-  if (!abs) return null;
-  // “More info” DMH pages often redirect to ticketsolve; we follow whatever we got.
-  return abs;
-}
-
-// ---- Main scrape -----------------------------------------------------------
-
-async function main() {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
-
-  const out = [];
-
+function parseDateFromCardBits(dateStr) {
+  // Cards usually show like "FRI 17 OCT 2025" and time is on the Ticketsolve page.
+  // We keep date only; time will be regularized after following the book link.
   try {
-    await page.goto(ROOT, { waitUntil: 'domcontentloaded' });
+    // Try to let Date parse it; if not, return null and let event page overwrite.
+    const d = new Date(dateStr);
+    if (!Number.isNaN(d.valueOf())) return d.toISOString();
+  } catch {}
+  return null;
+}
 
-    const cards = await paginateCards(page);
+async function scrapeListPage(ctx, pageNo) {
+  const url = pageNo === 1 ? LIST_URL : `${LIST_URL}?_paged=${pageNo}`;
+  await ctx.goto(url, { waitUntil: 'domcontentloaded' });
 
-    for (const card of cards) {
-      const event = {
-        title: card.title || '',
-        start: parseDateFromCardText(card.date) || null,
-        status: card.btnText || '',
-        override_pct: statusHeuristicToPct(card.btnText)
-      };
+  // Event cards
+  const cards = await ctx.$$('[class*="card-event"], .card-event, article:has(a:has-text("BOOK NOW")), article:has(.cta)');
+  const items = [];
 
-      const href = extractBookNowHref(card.bookHref);
-      if (!href) {
-        out.push(event);
-        continue;
-      }
+  for (const card of cards) {
+    const title = (await card.$eval('.title, h3, h2', el => el.textContent?.trim()).catch(() => null)) ||
+                  (await card.$eval('a[href*="/event/"]', el => el.textContent?.trim()).catch(() => null));
 
-      // Only try the ticketsolve deep scrape if it’s a ticketsolve domain or a DMH event that sends us there
-      let sold_pct = null;
-      try {
-        const evPage = await browser.newPage();
-        await evPage.goto(href, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    if (!title) continue;
 
-        // If this is a DMH event detail page (not yet ticketsolve), find any “Book” link to ticketsolve
-        if (!/ticketsolve\.com/i.test(evPage.url())) {
-          const ts = await evPage.$('a[href*="ticketsolve.com"]');
-          if (ts) {
-            const tsHref = await ts.getAttribute('href');
-            if (tsHref) {
-              await evPage.goto(tsHref, { waitUntil: 'domcontentloaded', timeout: 45000 });
-            }
-          }
-        }
+    const dateText = await card.$eval('.date', el => el.textContent?.trim()).catch(() => null);
 
-        // If we’re on ticketsolve, try to compute seat map percentage
-        if (/ticketsolve\.com/i.test(evPage.url())) {
-          // small wait for their app-y code
-          await evPage.waitForTimeout(800);
-          sold_pct = await computeSeatSoldPctOnTicketsolve(evPage);
-        }
-
-        await evPage.close();
-      } catch {
-        // swallow — we’ll keep heuristic
-      }
-
-      if (typeof sold_pct === 'number') {
-        event.sold_pct = sold_pct;
-        // keep override_pct for debugging/visibility but you can remove it if you prefer
-      }
-
-      out.push(event);
+    // Find status button (BOOK NOW / SOLD OUT / MORE INFO)
+    let status = await card.$eval('.cta.cta-primary', el => el.textContent?.trim()).catch(() => null);
+    if (!status) {
+      status = await card.$eval('a[aria-label], .cta', el => el.textContent?.trim()).catch(() => '');
     }
 
-    // Ensure output dir
-    await fs.mkdir(path.dirname(OUTPUT), { recursive: true });
-    await fs.writeFile(OUTPUT, JSON.stringify(out, null, 2), 'utf8');
-    console.log(`Wrote ${out.length} events -> ${OUTPUT}`);
-  } finally {
-    await browser.close();
+    // Book link if present
+    const bookHref =
+      await card.$eval('a.cta.cta-primary[href], a[href*="ticketsolve"][href]', el => el.getAttribute('href')).catch(() => null);
+
+    items.push({ title, dateText, status, bookHref });
   }
+
+  return items;
 }
 
-main().catch(err => {
+async function run() {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+
+  const all = [];
+  for (let p = 1; p <= MAX_PAGES; p++) {
+    const batch = await scrapeListPage(page, p);
+    if (!batch.length) break;
+    all.push(...batch);
+  }
+
+  // Visit Ticketsolve pages to enrich with accurate date/time and % sold
+  const results = [];
+  for (const row of all) {
+    // Skip duplicates by title+date when WP shows multiple tiles across pages
+    const exists = results.find(r => r.title === row.title && r.start?.slice(0, 10) === row.start?.slice(0, 10));
+    if (exists) continue;
+
+    let startISO = null;
+    let pct = null;
+
+    if (row.bookHref) {
+      try {
+        // Some DMH links are relative to ticketsolve domain; ensure absolute.
+        const href = row.bookHref.startsWith('http')
+          ? row.bookHref
+          : new URL(row.bookHref, 'https://demontforthall.ticketsolve.com').toString();
+
+        await page.goto(href, { waitUntil: 'domcontentloaded' });
+
+        // Extract exact datetime shown on Ticketsolve page (usually “Friday 3 October 2025, 19:30”)
+        const dtText = await page.textContent('text=/\\d{1,2}:[0-5]\\d/').catch(() => null);
+        // There is also an icon row containing the date – try a broader scrape:
+        const headerDt =
+          (await page.textContent('xpath=//*[contains(@class,"Date") or contains(text(), ",")]').catch(() => null)) ||
+          dtText;
+
+        if (headerDt) {
+          const parsed = Date.parse(headerDt);
+          if (!Number.isNaN(parsed)) startISO = new Date(parsed).toISOString();
+        }
+
+        // Seat percentages (reserved seating only)
+        pct = await computePctSoldFromTicketsolve(page);
+      } catch {
+        // ignore – fallbacks will handle
+      }
+    }
+
+    const status = (row.status || '').trim();
+    const override_pct = Number.isFinite(pct) ? pct : fallbackPct(status);
+
+    // If we still have no date, fall back to card’s date text
+    if (!startISO && row.dateText) {
+      startISO = parseDateFromCardBits(row.dateText);
+    }
+
+    // If we still have no date, leave null (index will display without it)
+    results.push({
+      title: row.title,
+      start: startISO || null,
+      status,
+      override_pct
+    });
+  }
+
+  // Deduplicate (title+start)
+  const unique = [];
+  const seen = new Set();
+  for (const e of results) {
+    const key = `${e.title}__${e.start || ''}`;
+    if (!seen.has(key)) { seen.add(key); unique.push(e); }
+  }
+
+  await fs.mkdir(path.dirname(OUT_PATH), { recursive: true });
+  await fs.writeFile(OUT_PATH, JSON.stringify(unique, null, 2));
+  console.log(`Wrote ${unique.length} events -> ${OUT_PATH}`);
+
+  await browser.close();
+}
+
+run().catch(err => {
   console.error('Scrape error:', err);
   process.exit(1);
 });
+
