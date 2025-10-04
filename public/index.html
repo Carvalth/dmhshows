@@ -30,7 +30,6 @@
     .legend span{display:inline-flex;gap:6px;align-items:center}
     .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
 
-    /* Calendar */
     .calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
     .weekday{font-size:12px;color:var(--muted);text-align:center}
     .day{background:var(--grid);border:1px solid #2a2d3a;border-radius:10px;min-height:68px;padding:6px;display:flex;flex-direction:column;gap:6px}
@@ -38,7 +37,6 @@
     .bar{height:6px;border-radius:4px;background:#253136}
     .tag{font-size:11px;padding:3px 6px;border-radius:999px;display:inline-block;border:1px solid #2a2d3a;color:#d7dbe7}
 
-    /* Event list */
     .events{display:flex;flex-direction:column;gap:10px}
     .event{display:flex;gap:10px;justify-content:space-between;align-items:baseline;border:1px solid #24273a;border-radius:12px;padding:10px;background:#161826}
     .event .title{font-weight:600}
@@ -47,17 +45,14 @@
     .footer{margin:32px 0;color:var(--muted);font-size:12px}
     .muted{color:var(--muted)}
     details{background:#10121b;border:1px solid #24273a;border-radius:12px;padding:10px}
-    textarea{width:100%;min-height:160px;background:#0d0f16;color:var(--text);border:1px solid #24273a;border-radius:12px;padding:10px}
+    textarea{width:100%;min-height:160px;background:#0d0f16;color:#fff;border:1px solid #24273a;border-radius:12px;padding:10px}
     .pill{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid #2a2d3a}
   </style>
 </head>
 <body>
-  <header>
-    <h1>De Montfort Hall — Busy Show Periods</h1>
-  </header>
+  <header><h1>De Montfort Hall — Busy Show Periods</h1></header>
   <main>
     <div class="grid">
-      <!-- Left: Calendar -->
       <section class="card">
         <div class="head">
           <h2>Calendar heatmap</h2>
@@ -79,7 +74,6 @@
         </div>
       </section>
 
-      <!-- Right: List + Import -->
       <section class="card">
         <div class="head">
           <h2>Shows</h2>
@@ -96,7 +90,7 @@
           <hr style="border:0;border-top:1px solid #24273a;margin:14px 0;opacity:.7" />
           <details>
             <summary><strong>Paste/Import data</strong> (JSON)</summary>
-            <textarea id="jsonInput" placeholder='[{"title":"Example","start":"2025-10-18","status":"BOOK NOW","override_pct":48}]'></textarea>
+            <textarea id="jsonInput" placeholder='[{"title":"Example","start":"2025-10-18T19:30:00Z","status":"BOOK NOW","override_pct":48}]'></textarea>
             <div class="controls" style="margin-top:8px">
               <button id="importBtn">Import</button>
               <button id="resetBtn" title="Restore sample data">Reset sample</button>
@@ -107,9 +101,7 @@
       </section>
     </div>
 
-    <p class="footer"><strong>Data note:</strong> Percentages reflect estimated
-    <em>tickets sold</em>. When exact numbers aren’t available from the box office,
-    we fall back to an approximate status-based estimate.</p>
+    <p class="footer"><strong>Data note:</strong> Percentages reflect estimated <em>tickets sold</em>. When exact numbers aren’t available from the box office, we fall back to a status-based estimate.</p>
   </main>
 
   <script>
@@ -117,29 +109,24 @@
     const fmtShort = new Intl.DateTimeFormat(undefined,{month:'short',day:'2-digit'});
     const fmtTime = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit'});
 
-    // ==== CHANGED: use override_pct when available ====
+    function clamp(v,a,b){ return Math.max(a, Math.min(b, Math.round(v))); }
+
+    // Use sold_pct (measured), else override_pct, else status heuristic
     function pctSold(ev){
-  // 1) Best: measured from Ticketsolve seat map (added by scraper)
-  if (Number.isFinite(ev?.sold_pct)) return clamp(ev.sold_pct, 0, 100);
-
-  // 2) Fallback: override/heuristic percentage from scraper
-  if (Number.isFinite(ev?.override_pct)) return clamp(ev.override_pct, 0, 100);
-
-  // 3) Last resort: infer from status text
-  const s=(ev.status||'').toLowerCase();
-  if(s.includes('sold')) return 100;
-  if(s.includes('limited')) return 85;
-  if(s.includes('last')||s.includes('low')) return 75;
-  if(s.includes('book')) return 48;
-  return 30;
-}
-(Keep 
-    function clamp(v, a, b){ return Math.max(a, Math.min(b, Math.round(v))); }
+      if (Number.isFinite(ev?.sold_pct)) return clamp(ev.sold_pct, 0, 100);
+      if (Number.isFinite(ev?.override_pct)) return clamp(ev.override_pct, 0, 100);
+      const s=(ev.status||'').toLowerCase();
+      if(s.includes('sold')) return 100;
+      if(s.includes('limited')) return 85;
+      if(s.includes('last')||s.includes('low')) return 75;
+      if(s.includes('book')) return 48;
+      return 30;
+    }
 
     function parseDate(d){ return d? new Date(d):null; }
     function toLocalKey(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
 
-    const SAMPLE=[{title:"Level 42",start:"2025-10-06T19:00:00",status:"SOLD OUT",override_pct:100}];
+    const SAMPLE=[{title:"Sample",start:"2025-10-06T19:00:00Z",status:"SOLD OUT",override_pct:100}];
     let state={events:[...SAMPLE],month:new Date(new Date().getFullYear(),new Date().getMonth(),1)};
 
     const monthPicker=document.getElementById('monthPicker');
@@ -151,10 +138,11 @@
       monthPicker.value=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
       monthLabel.textContent=d.toLocaleString(undefined,{month:'long',year:'numeric'});
     }
+
     function monthMatrix(date){
       const y=date.getFullYear(),m=date.getMonth();
       const first=new Date(y,m,1);
-      const startOffset=(first.getDay()+6)%7;
+      const startOffset=(first.getDay()+6)%7; // Mon-first
       const daysInMonth=new Date(y,m+1,0).getDate();
       const cells=[];
       for(let i=0;i<startOffset;i++) cells.push(null);
@@ -163,12 +151,12 @@
       return cells;
     }
 
-    // ==== CHANGED: store daily arrays of % sold (0–100) ====
     function buildDayScores(events){
       const map=new Map();
       for(const ev of events){
         if(!ev.start) continue;
         const d=new Date(ev.start);
+        if (isNaN(d)) continue;
         const key=toLocalKey(d);
         const pct=pctSold(ev);
         map.set(key,(map.get(key)||[]).concat(pct));
@@ -176,12 +164,12 @@
       return map;
     }
 
-    // ==== CHANGED: color thresholds now use % sold ====
     function getColor(pct){
-      if(pct>=99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
-      if(pct>=75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
-      if(pct>=40) return getComputedStyle(document.documentElement).getPropertyValue('--moderate');
-      return getComputedStyle(document.documentElement).getPropertyValue('--quiet');
+      const cs = getComputedStyle(document.documentElement);
+      if(pct>=99) return cs.getPropertyValue('--sold');
+      if(pct>=75) return cs.getPropertyValue('--busy');
+      if(pct>=40) return cs.getPropertyValue('--moderate');
+      return cs.getPropertyValue('--quiet');
     }
 
     function renderCalendar(){
@@ -205,7 +193,7 @@
           tag.textContent=`${avgPct}% sold${arr.length?' · '+arr.length+' show'+(arr.length>1?'s':''):''}`;
 
           cell.appendChild(dateEl);cell.appendChild(bar);cell.appendChild(tag);
-        }else{
+        } else {
           cell.style.visibility='hidden';
         }
         calendar.appendChild(cell);
@@ -232,43 +220,46 @@
         const dt=parseDate(ev.start);
         const when=document.createElement('div');when.className='meta';when.textContent=dt?fmt.format(dt):'';
 
-        const pill=document.createElement('span');pill.className='pill';
-        pill.textContent=ev.status||'';
-
-        // show % sold next to status
+        const pill=document.createElement('span');pill.className='pill';pill.textContent=ev.status||'';
         const pct = pctSold(ev);
-        const pctEl=document.createElement('span');pctEl.className='pill';
-        pctEl.style.marginLeft='6px';
-        pctEl.textContent=`${pct}% sold`;
+        const pctEl=document.createElement('span');pctEl.className='pill';pctEl.style.marginLeft='6px';pctEl.textContent=`${pct}% sold`;
 
         left.appendChild(title);left.appendChild(when);
         right.appendChild(pill); right.appendChild(pctEl);
-
         wrap.appendChild(left);wrap.appendChild(right);
         eventsEl.appendChild(wrap);
       }
     }
 
-    function renderAll(){setMonthInput(state.month);renderCalendar();renderEvents();}
+    function renderAll(){ setMonthInput(state.month); renderCalendar(); renderEvents(); }
+
     document.getElementById('prevBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()-1,1);renderAll();};
     document.getElementById('nextBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()+1,1);renderAll();};
     document.getElementById('sortSelect').onchange=renderAll;
     monthPicker.onchange=e=>{const[y,m]=e.target.value.split('-').map(Number);state.month=new Date(y,m-1,1);renderAll();};
-    document.getElementById('importBtn').onclick=()=>{try{const arr=JSON.parse(document.getElementById('jsonInput').value);if(!Array.isArray(arr))throw new Error('Must be array');state.events=arr;renderAll();}catch(err){alert(err.message)}};
+
+    document.getElementById('importBtn').onclick=()=>{try{
+      const arr=JSON.parse(document.getElementById('jsonInput').value);
+      if(!Array.isArray(arr)) throw new Error('Must be array');
+      state.events=arr; renderAll();
+    }catch(err){alert(err.message)}};
+
     document.getElementById('resetBtn').onclick=()=>{state.events=[...SAMPLE];renderAll();};
 
     renderAll();
   </script>
+
   <script>
     async function loadEventsFrom(url){
       try{
         const res=await fetch(url,{cache:'no-store'});
         if(!res.ok) return;
         const data=await res.json();
-        state.events=data;renderAll();
-      }catch(e){ /* ignore */ }
+        state.events=data; renderAll();
+      }catch(e){}
     }
-    loadEventsFrom('./dmh-events.json');
+    // serve dmh-events.json at the site root (public/ → /)
+    loadEventsFrom('/dmh-events.json');
   </script>
 </body>
 </html>
