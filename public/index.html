@@ -1,1 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>De Montfort Hall — Busy Show Periods</title>
+  <style>
+    :root{
+      --bg:#0b0c10; --panel:#12131a; --muted:#b0b4c0; --text:#f2f4f8; --accent:#8ab4f8;
+      --quiet:#3a5f0b; --moderate:#b38600; --busy:#b00020; --sold:#7c1a1a; --grid:#1e2030;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Inter,Arial,sans-serif;background:var(--bg);color:var(--text);}
+    header{position:sticky;top:0;background:rgba(11,12,16,.8);backdrop-filter:blur(8px);border-bottom:1px solid #222;padding:16px 20px;z-index:5}
+    h1{margin:0;font-size:20px;letter-spacing:.3px}
+    main{max-width:1100px;margin:24px auto;padding:0 16px}
+    .grid{display:grid;gap:16px;grid-template-columns:1.2fr .8fr}
+    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
 
+    .card{background:var(--panel);border:1px solid #222;border-radius:16px;box-shadow:0 6px 16px rgba(0,0,0,.25)}
+    .card h2{margin:0 0 8px 0;font-size:18px}
+    .card .head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid #222}
+    .card .body{padding:14px 16px}
+
+    .controls{display:flex;gap:8px;flex-wrap:wrap}
+    button, select, input[type="month"]{background:#171923;border:1px solid #2a2d3a;color:var(--text);padding:8px 10px;border-radius:10px;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+
+    .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+    .legend span{display:inline-flex;gap:6px;align-items:center}
+    .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
+
+    /* Calendar */
+    .calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+    .weekday{font-size:12px;color:var(--muted);text-align:center}
+    .day{background:var(--grid);border:1px solid #2a2d3a;border-radius:10px;min-height:68px;padding:6px;display:flex;flex-direction:column;gap:6px}
+    .day .date{font-size:12px;color:var(--muted)}
+    .bar{height:6px;border-radius:4px;background:#253136}
+    .tag{font-size:11px;padding:3px 6px;border-radius:999px;display:inline-block;border:1px solid #2a2d3a;color:#d7dbe7}
+
+    /* Event list */
+    .events{display:flex;flex-direction:column;gap:10px}
+    .event{display:flex;gap:10px;justify-content:space-between;align-items:baseline;border:1px solid #24273a;border-radius:12px;padding:10px;background:#161826}
+    .event .title{font-weight:600}
+    .event .meta{font-size:12px;color:var(--muted)}
+
+    .footer{margin:32px 0;color:var(--muted);font-size:12px}
+    .muted{color:var(--muted)}
+    details{background:#10121b;border:1px solid #24273a;border-radius:12px;padding:10px}
+    textarea{width:100%;min-height:160px;background:#0d0f16;color:var(--text);border:1px solid #24273a;border-radius:12px;padding:10px}
+    .pill{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid #2a2d3a}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>De Montfort Hall — Busy Show Periods</h1>
+  </header>
+  <main>
+    <div class="grid">
+      <!-- Left: Calendar -->
+      <section class="card">
+        <div class="head">
+          <h2>Calendar heatmap</h2>
+          <div class="controls">
+            <input type="month" id="monthPicker" />
+            <button id="prevBtn" title="Previous month">◀</button>
+            <button id="nextBtn" title="Next month">▶</button>
+          </div>
+        </div>
+        <div class="body">
+          <div class="legend" style="margin-bottom:10px">
+            <span><span class="dot" style="background:var(--quiet)"></span>Quiet</span>
+            <span><span class="dot" style="background:var(--moderate)"></span>Moderate</span>
+            <span><span class="dot" style="background:var(--busy)"></span>Busy</span>
+            <span><span class="dot" style="background:var(--sold)"></span>Sold out</span>
+          </div>
+          <div id="monthLabel" class="muted" style="margin:6px 0 10px 2px"></div>
+          <div class="calendar" id="calendar"></div>
+        </div>
+      </section>
+
+      <!-- Right: List + Import -->
+      <section class="card">
+        <div class="head">
+          <h2>Shows</h2>
+          <div class="controls">
+            <select id="sortSelect" title="Sort">
+              <option value="date">Sort: Date</option>
+              <option value="busyness">Sort: Busyness</option>
+              <option value="title">Sort: Title</option>
+            </select>
+          </div>
+        </div>
+        <div class="body">
+          <div class="events" id="events"></div>
+          <hr style="border:0;border-top:1px solid #24273a;margin:14px 0;opacity:.7" />
+          <details>
+            <summary><strong>Paste/Import data</strong> (JSON)</summary>
+            <textarea id="jsonInput" placeholder='[{"title":"Example","start":"2025-10-18","status":"BOOK NOW","override_pct":48}]'></textarea>
+            <div class="controls" style="margin-top:8px">
+              <button id="importBtn">Import</button>
+              <button id="resetBtn" title="Restore sample data">Reset sample</button>
+              <a id="exportBtn" href="#" class="pill" download="dmh-events.json">Export</a>
+            </div>
+          </details>
+        </div>
+      </section>
+    </div>
+
+    <p class="footer"><strong>Data note:</strong> Percentages reflect estimated
+    <em>tickets sold</em>. When exact numbers aren’t available from the box office,
+    we fall back to an approximate status-based estimate.</p>
+  </main>
+
+  <script>
+    const fmt = new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric'});
+    const fmtShort = new Intl.DateTimeFormat(undefined,{month:'short',day:'2-digit'});
+    const fmtTime = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit'});
+
+    // ==== CHANGED: use override_pct when available ====
+    function pctSold(ev){
+  // 1) Best: measured from Ticketsolve seat map (added by scraper)
+  if (Number.isFinite(ev?.sold_pct)) return clamp(ev.sold_pct, 0, 100);
+
+  // 2) Fallback: override/heuristic percentage from scraper
+  if (Number.isFinite(ev?.override_pct)) return clamp(ev.override_pct, 0, 100);
+
+  // 3) Last resort: infer from status text
+  const s=(ev.status||'').toLowerCase();
+  if(s.includes('sold')) return 100;
+  if(s.includes('limited')) return 85;
+  if(s.includes('last')||s.includes('low')) return 75;
+  if(s.includes('book')) return 48;
+  return 30;
+}
+(Keep 
+    function clamp(v, a, b){ return Math.max(a, Math.min(b, Math.round(v))); }
+
+    function parseDate(d){ return d? new Date(d):null; }
+    function toLocalKey(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+
+    const SAMPLE=[{title:"Level 42",start:"2025-10-06T19:00:00",status:"SOLD OUT",override_pct:100}];
+    let state={events:[...SAMPLE],month:new Date(new Date().getFullYear(),new Date().getMonth(),1)};
+
+    const monthPicker=document.getElementById('monthPicker');
+    const calendar=document.getElementById('calendar');
+    const monthLabel=document.getElementById('monthLabel');
+    const eventsEl=document.getElementById('events');
+
+    function setMonthInput(d){
+      monthPicker.value=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+      monthLabel.textContent=d.toLocaleString(undefined,{month:'long',year:'numeric'});
+    }
+    function monthMatrix(date){
+      const y=date.getFullYear(),m=date.getMonth();
+      const first=new Date(y,m,1);
+      const startOffset=(first.getDay()+6)%7;
+      const daysInMonth=new Date(y,m+1,0).getDate();
+      const cells=[];
+      for(let i=0;i<startOffset;i++) cells.push(null);
+      for(let d=1;d<=daysInMonth;d++) cells.push(new Date(y,m,d));
+      while(cells.length%7!==0) cells.push(null);
+      return cells;
+    }
+
+    // ==== CHANGED: store daily arrays of % sold (0–100) ====
+    function buildDayScores(events){
+      const map=new Map();
+      for(const ev of events){
+        if(!ev.start) continue;
+        const d=new Date(ev.start);
+        const key=toLocalKey(d);
+        const pct=pctSold(ev);
+        map.set(key,(map.get(key)||[]).concat(pct));
+      }
+      return map;
+    }
+
+    // ==== CHANGED: color thresholds now use % sold ====
+    function getColor(pct){
+      if(pct>=99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
+      if(pct>=75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
+      if(pct>=40) return getComputedStyle(document.documentElement).getPropertyValue('--moderate');
+      return getComputedStyle(document.documentElement).getPropertyValue('--quiet');
+    }
+
+    function renderCalendar(){
+      calendar.innerHTML='';
+      const days=monthMatrix(state.month);
+      const dayOccs=buildDayScores(state.events);
+      const names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+      names.forEach(n=>{const w=document.createElement('div');w.className='weekday';w.textContent=n;calendar.appendChild(w);});
+      for(const d of days){
+        const cell=document.createElement('div');cell.className='day';
+        if(d){
+          const key=toLocalKey(d);
+          const arr=dayOccs.get(key)||[];
+          const avgPct=arr.length?Math.round(arr.reduce((a,b)=>a+b,0)/arr.length):0;
+
+          const dateEl=document.createElement('div');dateEl.className='date';dateEl.textContent=fmtShort.format(d);
+          const bar=document.createElement('div');bar.className='bar';
+          bar.style.background=`linear-gradient(90deg, ${getColor(avgPct)} ${avgPct}%, #253136 ${avgPct}%)`;
+
+          const tag=document.createElement('span');tag.className='tag';
+          tag.textContent=`${avgPct}% sold${arr.length?' · '+arr.length+' show'+(arr.length>1?'s':''):''}`;
+
+          cell.appendChild(dateEl);cell.appendChild(bar);cell.appendChild(tag);
+        }else{
+          cell.style.visibility='hidden';
+        }
+        calendar.appendChild(cell);
+      }
+    }
+
+    function renderEvents(){
+      eventsEl.innerHTML='';
+      const sortSel = document.getElementById('sortSelect');
+      const arr=[...state.events];
+
+      if (sortSel.value === 'busyness') {
+        arr.sort((a,b)=>pctSold(b)-pctSold(a) || new Date(a.start)-new Date(b.start));
+      } else if (sortSel.value === 'title') {
+        arr.sort((a,b)=>(a.title||'').localeCompare(b.title||''));
+      } else {
+        arr.sort((a,b)=>new Date(a.start)-new Date(b.start));
+      }
+
+      for(const ev of arr){
+        const wrap=document.createElement('div');wrap.className='event';
+        const left=document.createElement('div');const right=document.createElement('div');
+        const title=document.createElement('div');title.className='title';title.textContent=ev.title||'';
+        const dt=parseDate(ev.start);
+        const when=document.createElement('div');when.className='meta';when.textContent=dt?fmt.format(dt):'';
+
+        const pill=document.createElement('span');pill.className='pill';
+        pill.textContent=ev.status||'';
+
+        // show % sold next to status
+        const pct = pctSold(ev);
+        const pctEl=document.createElement('span');pctEl.className='pill';
+        pctEl.style.marginLeft='6px';
+        pctEl.textContent=`${pct}% sold`;
+
+        left.appendChild(title);left.appendChild(when);
+        right.appendChild(pill); right.appendChild(pctEl);
+
+        wrap.appendChild(left);wrap.appendChild(right);
+        eventsEl.appendChild(wrap);
+      }
+    }
+
+    function renderAll(){setMonthInput(state.month);renderCalendar();renderEvents();}
+    document.getElementById('prevBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()-1,1);renderAll();};
+    document.getElementById('nextBtn').onclick=()=>{state.month=new Date(state.month.getFullYear(),state.month.getMonth()+1,1);renderAll();};
+    document.getElementById('sortSelect').onchange=renderAll;
+    monthPicker.onchange=e=>{const[y,m]=e.target.value.split('-').map(Number);state.month=new Date(y,m-1,1);renderAll();};
+    document.getElementById('importBtn').onclick=()=>{try{const arr=JSON.parse(document.getElementById('jsonInput').value);if(!Array.isArray(arr))throw new Error('Must be array');state.events=arr;renderAll();}catch(err){alert(err.message)}};
+    document.getElementById('resetBtn').onclick=()=>{state.events=[...SAMPLE];renderAll();};
+
+    renderAll();
+  </script>
+  <script>
+    async function loadEventsFrom(url){
+      try{
+        const res=await fetch(url,{cache:'no-store'});
+        if(!res.ok) return;
+        const data=await res.json();
+        state.events=data;renderAll();
+      }catch(e){ /* ignore */ }
+    }
+    loadEventsFrom('/dmh-events.json');
+  </script>
+</body>
+</html>
