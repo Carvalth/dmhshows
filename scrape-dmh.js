@@ -1,329 +1,297 @@
-// scrape-dmh.js  — De Montfort Hall -> public/dmh-events.json
-// Node 18+; Playwright installed. If you use .mjs, set "type":"module" in package.json.
+// scrape-dmh.js
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc.js';
+import tz from 'dayjs/plugin/timezone.js';
+import { chromium } from 'playwright';
 
-import { chromium } from "playwright";
-import fs from "fs/promises";
-import path from "path";
+dayjs.extend(utc);
+dayjs.extend(tz);
 
-const ROOT = process.cwd();
-const OUT = path.join(ROOT, "public", "dmh-events.json");
-const LIST_URL = "https://www.demontforthall.co.uk/whats-on/";
-const MAX_PAGES = 12;
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const OUTFILE = path.join(ROOT, 'public', 'dmh-events.json');
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36";
+// ---------- utils ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const trim = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-/* ---------- utils ---------- */
-
-const MONTHS = {
-  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
-  july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
-  jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
-};
-
-function asISOFromLocal(y, m0, d, hh = 19, mm = 30) {
-  return new Date(Date.UTC(y, m0, d, hh, mm, 0)).toISOString();
+function inferOverridePct(status) {
+  const s = (status || '').toLowerCase();
+  if (s.includes('sold')) return 100;
+  if (s.includes('limited')) return 85;
+  if (s.includes('last') || s.includes('low')) return 75;
+  if (s.includes('book')) return 48;
+  return 30; // more info / unknown
 }
 
-function fallbackPct(status = "") {
-  const s = String(status).toLowerCase();
-  if (s.includes("sold")) return 100;
-  if (s.includes("limited")) return 85;
-  if (s.includes("last") || s.includes("low")) return 75;
-  if (s.includes("book now")) return 48;
-  return 30;
-}
-
-async function delay(ms = 350) { await new Promise(r => setTimeout(r, ms)); }
-
-/* ---------- date parsing ---------- */
-
-function parseLongUkDateTime(txt) {
-  if (!txt) return null;
-  const t = txt.replace(/\s+/g, " ").trim();
-  const re =
-    /(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?)\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}),\s+(\d{1,2}):(\d{2})(?:\s*(AM|PM))?/i;
-  const m = t.match(re);
+function toISOLondon(dateText) {
+  // expects text like "Friday 3 October 2025, 19:30"
+  const m = /(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}).*?(\d{1,2}):(\d{2})/i.exec(dateText || '');
   if (!m) return null;
-
-  const day = +m[1];
-  const monName = m[2].toLowerCase();
-  const year = +m[3];
-  let hour = +m[4];
-  const minute = +m[5];
-  const ampm = (m[6] || "").toUpperCase();
-
-  const month = MONTHS[monName];
-  if (month == null) return null;
-
-  if (ampm) {
-    if (ampm === "PM" && hour < 12) hour += 12;
-    if (ampm === "AM" && hour === 12) hour = 0;
-  }
-  return asISOFromLocal(year, month, day, hour, minute);
+  const [, d, monthStr, y, hh, mm] = m;
+  const dt = dayjs.tz(`${d} ${monthStr} ${y} ${hh}:${mm}`, 'D MMMM YYYY HH:mm', 'Europe/London');
+  return dt.isValid() ? dt.toDate().toISOString() : null;
 }
 
-function parseCardDateOnly(txt) {
-  if (!txt) return null;
-  const t = txt.replace(/\s+/g, " ").trim();
-  const m = t.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})/i);
-  if (!m) return null;
-
-  const day = +m[1];
-  const monName = m[2].toLowerCase();
-  const year = +m[3];
-  const month = MONTHS[monName];
-  if (month == null) return null;
-
-  return asISOFromLocal(year, month, day, 19, 30); // default time if only a date exists
+// Prefer SOLD OUT > BOOK NOW > MORE INFO
+function pickStatusFromButtons(btnTexts) {
+  const upper = btnTexts.map(t => t.toUpperCase());
+  if (upper.some(t => t.includes('SOLD OUT'))) return 'SOLD OUT';
+  if (upper.some(t => t.includes('BOOK'))) return 'BOOK NOW';
+  return 'More info';
 }
 
-/* ---------- ticketsolve helpers ---------- */
+// ---------- ticketsolve helpers ----------
 
-async function getStartFromTicketsolve(page) {
+async function openSeatMapAndMeasure(page, eventUrl) {
+  // open the ticketsolve seat page (already a /seats or /events URL)
+  await page.goto(eventUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // Grab the human-readable date/time block
+  let startIso = null;
   try {
-    const blocks = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent || ""));
-    for (const b of blocks) {
-      try {
-        const j = JSON.parse(b);
-        const arr = Array.isArray(j) ? j : [j];
-        for (const o of arr) {
-          if (o?.["@type"] === "Event" && o.startDate) return new Date(o.startDate).toISOString();
-          if (o?.event?.startDate) return new Date(o.event.startDate).toISOString();
+    const whenText = await page.locator('text=,').first().innerText().catch(() => null);
+    // The line with comma usually is "Friday 3 October 2025, 19:30"
+    if (whenText) {
+      const iso = toISOLondon(whenText);
+      if (iso) startIso = iso;
+    }
+  } catch (_) {}
+
+  // Select a zone if needed
+  try {
+    // Ticketsolve pages vary: sometimes there is a <select>, sometimes a button menu.
+    const select = page.locator('select').first();
+    if (await select.count()) {
+      const options = await select.evaluateAll(els => els[0] ? Array.from(els[0].options).map(o => o.textContent) : []);
+      let valueToPick = null;
+      if (options.some(t => /stalls.*circles/i.test(t))) {
+        valueToPick = (await select.locator('option', { hasText: /stalls.*circles/i }).first().getAttribute('value'));
+      } else {
+        // choose first non-empty option
+        valueToPick = await select.locator('option:not([disabled])').nth(0).getAttribute('value');
+      }
+      if (valueToPick) {
+        await select.selectOption(valueToPick);
+        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(()=>{});
+      }
+    } else {
+      const zoneBtn = page.locator('button:has-text("Select a zone"), [role="combobox"]').first();
+      if (await zoneBtn.count()) {
+        await zoneBtn.click().catch(()=>{});
+        const option =
+          page.locator('[role="option"] :text("Stalls and Circles")').first()
+            .or(page.locator('[role="option"]', { hasText: /Stalls.*Circles/i }).first())
+            .or(page.locator('[role="option"]').first());
+        if (await option.count()) {
+          await option.click().catch(()=>{});
+          await page.keyboard.press('Escape').catch(()=>{});
+          await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(()=>{});
         }
-      } catch {}
-    }
-  } catch {}
-
-  try {
-    const text = await page.$eval("body", el => el.innerText || "");
-    const iso = parseLongUkDateTime(text);
-    if (iso) return iso;
-  } catch {}
-
-  try {
-    const metas = await page.$$eval("meta", els =>
-      els.map(e => [e.getAttribute("property") || e.getAttribute("name"), e.getAttribute("content")])
-    );
-    for (const [, v] of metas) {
-      if (!v) continue;
-      const byLong = parseLongUkDateTime(v);
-      if (byLong) return byLong;
-      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v)) {
-        try { return new Date(v).toISOString(); } catch {}
       }
     }
-  } catch {}
-  return null;
+  } catch (_) {}
+
+  // wait a tick for seatmap to render
+  await sleep(800);
+
+  // Try to count seats
+  const counts = await page.evaluate(() => {
+    const out = { available: 0, unavailable: 0, total: 0 };
+
+    // Collect likely seat nodes inside svg/canvas areas
+    const nodes = Array.from(document.querySelectorAll('svg circle, svg path, [data-seat-id], [data-status]'));
+    if (!nodes.length) return out;
+
+    for (const el of nodes) {
+      // common attributes we can read
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      const status = (el.getAttribute('data-status') || '').toLowerCase();
+      const title = (el.getAttribute('title') || '').toLowerCase();
+      const cls = (el.getAttribute('class') || '').toLowerCase();
+
+      const markUnavailable =
+        aria.includes('unavailable') || aria.includes('not available') ||
+        status.includes('unavailable') || status.includes('sold') ||
+        cls.includes('unavailable') || title.includes('unavailable');
+
+      const markAvailable =
+        aria.includes('available') || status.includes('available') || cls.includes('available') || title.includes('available');
+
+      if (markUnavailable) out.unavailable++;
+      else if (markAvailable) out.available++;
+    }
+
+    out.total = out.available + out.unavailable;
+    return out;
+  }).catch(() => ({ available: 0, unavailable: 0, total: 0 }));
+
+  if (counts.total > 0) {
+    const pct = Math.round((counts.unavailable / counts.total) * 100);
+    return { sold_pct: pct, start: startIso };
+  }
+
+  return { sold_pct: null, start: startIso };
 }
 
-async function percentSoldFromTicketsolve(page) {
+async function followToTicketsolveAndMeasure(browser, card) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
   try {
-    const trigger =
-      (await page.$('button:has-text("Select a zone")')) ||
-      (await page.$('[role="button"]:has-text("Select a zone")')) ||
-      (await page.$('button:has-text("Stalls and Circles")'));
-    if (trigger) {
-      await trigger.click();
-      const prefer = await page.$('text="Stalls and Circles"');
-      if (prefer) await prefer.click();
-      else {
-        const first = await page.$('[role="listbox"] [role="option"], .select__menu [role="option"]');
-        if (first) await first.click();
-      }
-      await delay(700);
+    // If we already have a direct book link, use it
+    if (card.bookUrl) {
+      return await openSeatMapAndMeasure(page, card.bookUrl);
     }
-  } catch {}
 
-  const { available, unavailable } = await page.evaluate(() => {
-    const q = s => Array.from(document.querySelectorAll(s));
-    let available = 0, unavailable = 0;
-
-    const attr = q("[data-seat-status]");
-    for (const el of attr) {
-      const st = (el.getAttribute("data-seat-status") || "").toLowerCase();
-      if (st.includes("available")) available++;
-      else if (st.includes("unavailable") || st.includes("in_cart") || st.includes("reserved") || st.includes("held")) {
-        unavailable++;
+    // Otherwise open the event page, then click its Book Now
+    if (card.moreInfoUrl) {
+      await page.goto(card.moreInfoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      const bookLink = page.locator('a:has-text("BOOK NOW")').first();
+      if (await bookLink.count()) {
+        const href = await bookLink.getAttribute('href');
+        if (href) {
+          const absolute = href.startsWith('http') ? href : new URL(href, page.url()).href;
+          return await openSeatMapAndMeasure(page, absolute);
+        }
       }
     }
-    if (available + unavailable === 0) {
-      const av = q(".seat--available, .seat.available, [class*='seat'][class*='available']");
-      const un = q(".seat--unavailable, .seat.unavailable, .seat.in-cart, .seat.selected, [class*='seat'][class*='unavailable']");
-      available = av.length; unavailable = un.length;
-    }
-    if (available + unavailable === 0) {
-      const aria = q("[aria-label]");
-      for (const el of aria) {
-        const lab = (el.getAttribute("aria-label") || "").toLowerCase();
-        if (lab.includes("available")) available++;
-        else if (lab.includes("unavailable") || lab.includes("in cart") || lab.includes("reserved")) unavailable++;
-      }
-    }
-    return { available, unavailable };
-  });
-
-  const total = available + unavailable;
-  if (!total) return null;
-  return Math.round((unavailable / total) * 100);
+  } catch (_) {
+    // ignore measurement failure
+  } finally {
+    await context.close();
+  }
+  return { sold_pct: null, start: null };
 }
 
-/* ---------- DMH pages ---------- */
+// ---------- scraping cards ----------
 
-function normaliseUrl(href, base) {
-  try { return new URL(href, base).toString(); } catch { return href; }
-}
+async function scrapeListCards(pageUrl, page) {
+  await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-// FIXED: no :has() / :contains() — we iterate links/buttons and inspect textContent
-async function scrapeListCards(page, pageNo) {
-  const url = pageNo === 1 ? LIST_URL : `${LIST_URL}?_paged=${pageNo}`;
-  await page.goto(url, { waitUntil: "domcontentloaded" });
+  const cards = await page.$$eval('[class*="card"], article, .whats-on__item, .event', nodes => {
+    const items = [];
+    for (const el of nodes) {
+      // Filter to only true event cards (must have a visible date block and a title)
+      const dateEl = el.querySelector(':scope :is(time, .date, [class*="date"])');
+      const titleEl = el.querySelector(':scope a, :scope h3, :scope h2');
+      if (!titleEl) continue;
 
-  return await page.$eval("body", (body) => {
-    const out = [];
-    if (!body) return out;
-
-    const cards = body.querySelectorAll(".card-event, [class*='card-event'], article");
-    for (const card of cards) {
-      let title =
-        card.querySelector(".title")?.textContent?.trim() ||
-        card.querySelector("h3, h2")?.textContent?.trim();
-      if (!title) {
-        const a = card.querySelector("a[href*='/event/']");
-        title = a?.textContent?.trim() || null;
-      }
+      const title = (titleEl.textContent || '').replace(/\s+/g, ' ').trim();
       if (!title) continue;
 
-      const dateTxt =
-        card.querySelector(".date")?.textContent?.trim() ||
-        card.querySelector("[class*='date']")?.textContent?.trim() ||
-        null;
+      // Buttons / links inside card
+      const links = Array.from(el.querySelectorAll('a'));
+      const btnTexts = links.map(a => (a.textContent || '').replace(/\s+/g, ' ').trim());
 
-      let bookHref = null;
-      let infoHref = null;
-      let status = "More info";
-
-      // look through all buttons/links in the card
-      const clickable = card.querySelectorAll("a, button");
-      for (const el of clickable) {
-        const txt = (el.textContent || "").trim().toUpperCase();
-        const href = el.getAttribute("href") || "";
-
-        if (txt.includes("BOOK NOW")) {
-          bookHref = href || bookHref;
-          status = "BOOK NOW";
-        } else if (txt.includes("SOLD OUT")) {
-          // treat as status; some cards show SOLD OUT instead of book
-          status = "SOLD OUT";
-          if (!bookHref) bookHref = href; // sometimes still links through
-        } else if (txt.includes("MORE INFO")) {
-          infoHref = href || infoHref;
-          if (status === "More info") status = "More info";
-        } else if (!infoHref && href.includes("/event/")) {
-          infoHref = href;
+      // URLs
+      let bookUrl = null;
+      let moreInfoUrl = null;
+      for (const a of links) {
+        const t = (a.textContent || '').toUpperCase();
+        const href = a.getAttribute('href') || '';
+        if (t.includes('BOOK') || t.includes('SOLD')) {
+          bookUrl = href;
+        } else if (!moreInfoUrl && t.includes('MORE')) {
+          moreInfoUrl = href;
         }
+        if (bookUrl && moreInfoUrl) break;
       }
 
-      // fallback if we didn't see explicit buttons
-      if (!infoHref) {
-        const a = card.querySelector("a[href*='/event/']");
-        if (a) infoHref = a.getAttribute("href");
-      }
-      if (!bookHref) {
-        const a = card.querySelector("a[href*='ticketsolve']");
-        if (a) bookHref = a.getAttribute("href");
-      }
-
-      out.push({ title, dateTxt, bookHref, infoHref, status });
+      items.push({
+        title,
+        status: 'More info',         // placeholder, fix below
+        btnTexts,
+        bookUrl,
+        moreInfoUrl,
+        dateText: dateEl ? dateEl.textContent : null,
+      });
     }
-    return out;
+    return items;
   });
-}
 
-async function getStartFromDmhInfo(page, url) {
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    const text = await page.$eval("body", el => el.innerText || "");
-    const iso = parseLongUkDateTime(text);
-    if (iso) return iso;
-
-    const d = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}/i);
-    const t = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
-    if (d && t) {
-      const iso2 = parseLongUkDateTime(`${d[0]}, ${t[0]}`);
-      if (iso2) return iso2;
+  // Normalise URLs/status
+  for (const c of cards) {
+    c.status = pickStatusFromButtons(c.btnTexts || []);
+    // absolute URLs
+    if (c.bookUrl && !/^https?:\/\//i.test(c.bookUrl)) {
+      c.bookUrl = new URL(c.bookUrl, pageUrl).href;
     }
-  } catch {}
-  return null;
-}
+    if (c.moreInfoUrl && !/^https?:\/\//i.test(c.moreInfoUrl)) {
+      c.moreInfoUrl = new URL(c.moreInfoUrl, pageUrl).href;
+    }
+  }
 
-/* ---------- runner ---------- */
+  return cards;
+}
 
 async function run() {
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ userAgent: UA, viewport: { width: 1280, height: 900 } });
+  const page = await browser.newPage();
 
-  const collected = [];
-  for (let p = 1; p <= MAX_PAGES; p++) {
-    const rows = await scrapeListCards(page, p);
-    if (!rows.length) break;
-    collected.push(...rows);
+  const base = 'https://www.demontforthall.co.uk/whats-on/';
+  let current = 1;
+  const all = [];
+
+  while (true) {
+    const url = current === 1 ? base : `${base}?page=${current}`;
+    const cards = await scrapeListCards(url, page);
+    // stop if a page returns no cards
+    if (!cards.length) break;
+
+    // measure each card
+    for (const card of cards) {
+      let start = null;
+      let sold_pct = null;
+
+      if (card.status === 'SOLD OUT' || card.status === 'BOOK NOW') {
+        // Try to measure on Ticketsolve
+        try {
+          const res = await followToTicketsolveAndMeasure(browser, card);
+          if (res.start) start = res.start;
+          if (Number.isFinite(res.sold_pct)) sold_pct = res.sold_pct;
+        } catch (_) {}
+      }
+
+      // Fallbacks
+      if (!start && card.dateText) {
+        // date on card might not have time; leave null if we can’t parse time
+        // We’ll keep day-only ISO if possible at 00:00Z; UI will still place it on calendar day.
+        const cardDate = dayjs(card.dateText.replace(/[,\.]/g,' '), 'ddd D MMM YYYY', 'en', true);
+        if (cardDate.isValid()) start = cardDate.toDate().toISOString();
+      }
+
+      const status = card.status;
+      const override_pct = Number.isFinite(sold_pct) ? undefined : inferOverridePct(status);
+
+      all.push({
+        title: card.title,
+        start: start || null,
+        status,
+        ...(Number.isFinite(sold_pct) ? { sold_pct } : { override_pct }),
+      });
+    }
+
+    current += 1;
+    // be polite between pages
+    await sleep(400);
   }
-
-  const results = [];
-  for (const row of collected) {
-    let startISO = null;
-    let pct = null;
-
-    const bookUrl = row.bookHref ? normaliseUrl(row.bookHref, "https://demontforthall.co.uk/") : null;
-    const infoUrl = row.infoHref ? normaliseUrl(row.infoHref, "https://www.demontforthall.co.uk/") : null;
-
-    if (bookUrl) {
-      try {
-        await page.goto(bookUrl, { waitUntil: "domcontentloaded" });
-        startISO = await getStartFromTicketsolve(page);
-
-        const soldBadge = await page.$(":is(button, a, span):has-text('SOLD OUT')");
-        if (soldBadge) pct = 100;
-
-        if (pct == null) pct = await percentSoldFromTicketsolve(page);
-      } catch {}
-    }
-
-    if (!startISO && infoUrl) {
-      startISO = await getStartFromDmhInfo(page, infoUrl);
-    }
-
-    if (!startISO && row.dateTxt) {
-      startISO = parseCardDateOnly(row.dateTxt);
-    }
-
-    const override_pct = Number.isFinite(pct) ? pct : fallbackPct(row.status);
-
-    results.push({
-      title: row.title,
-      start: startISO,
-      status: row.status,
-      override_pct
-    });
-
-    await delay(200);
-  }
-
-  // Deduplicate by title+start
-  const seen = new Set();
-  const unique = results.filter(e => {
-    const key = `${e.title}__${e.start || ""}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  await fs.mkdir(path.dirname(OUT), { recursive: true });
-  await fs.writeFile(OUT, JSON.stringify(unique, null, 2));
-  console.log(`Wrote ${unique.length} events → ${OUT}`);
 
   await browser.close();
+
+  // Write out
+  await fs.mkdir(path.dirname(OUTFILE), { recursive: true });
+  // Sort by start (nulls last)
+  all.sort((a, b) => {
+    const da = a.start ? +new Date(a.start) : Infinity;
+    const db = b.start ? +new Date(b.start) : Infinity;
+    return da - db;
+  });
+
+  await fs.writeFile(OUTFILE, JSON.stringify(all, null, 2), 'utf8');
+  console.log(`Wrote ${all.length} events → ${OUTFILE}`);
 }
 
 run().catch(err => {
