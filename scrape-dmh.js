@@ -1,5 +1,5 @@
 // Scrape De Montfort Hall -> public/dmh-events.json
-// node scripts/scrape-dmh.mjs
+// node scripts/scrape-dmh.mjs  (ensure "type": "module" in package.json if using .mjs)
 
 import { chromium } from "playwright";
 import fs from "fs/promises";
@@ -21,12 +21,8 @@ const MONTHS = {
   jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
 };
 
-function pad2(n){ return String(n).padStart(2, "0"); }
-
 function asISOFromLocal(y, m0, d, hh = 19, mm = 30) {
-  // treat as Europe/London local, export ISO UTC
-  const iso = new Date(Date.UTC(y, m0, d, hh, mm, 0)).toISOString();
-  return iso;
+  return new Date(Date.UTC(y, m0, d, hh, mm, 0)).toISOString();
 }
 
 function fallbackPct(status = "") {
@@ -42,14 +38,12 @@ async function delay(ms = 350) { await new Promise(r => setTimeout(r, ms)); }
 
 /* ---------- date parsing ---------- */
 
-// e.g. "Friday 3 October 2025, 19:30" or "Fri 3 Oct 2025, 7:30 PM"
 function parseLongUkDateTime(txt) {
   if (!txt) return null;
   const t = txt.replace(/\s+/g, " ").trim();
-
-  const re1 =
+  const re =
     /(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?)\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}),\s+(\d{1,2}):(\d{2})(?:\s*(AM|PM))?/i;
-  const m = t.match(re1);
+  const m = t.match(re);
   if (!m) return null;
 
   const day = +m[1];
@@ -69,7 +63,6 @@ function parseLongUkDateTime(txt) {
   return asISOFromLocal(year, month, day, hour, minute);
 }
 
-// e.g. the card date: "FRI 24 OCT 2025" or "MON 6 OCT 2025"
 function parseCardDateOnly(txt) {
   if (!txt) return null;
   const t = txt.replace(/\s+/g, " ").trim();
@@ -82,14 +75,12 @@ function parseCardDateOnly(txt) {
   const month = MONTHS[monName];
   if (month == null) return null;
 
-  // default time 19:30 if only date is available
-  return asISOFromLocal(year, month, day, 19, 30);
+  return asISOFromLocal(year, month, day, 19, 30); // default time if only a date exists
 }
 
-/* ---------- ticketsolve ---------- */
+/* ---------- ticketsolve helpers ---------- */
 
 async function getStartFromTicketsolve(page) {
-  // 1) JSON-LD
   try {
     const blocks = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent || ""));
     for (const b of blocks) {
@@ -104,14 +95,12 @@ async function getStartFromTicketsolve(page) {
     }
   } catch {}
 
-  // 2) Visible long date line
   try {
     const text = await page.$eval("body", el => el.innerText || "");
     const iso = parseLongUkDateTime(text);
     if (iso) return iso;
   } catch {}
 
-  // 3) Meta content hints
   try {
     const metas = await page.$$eval("meta", els =>
       els.map(e => [e.getAttribute("property") || e.getAttribute("name"), e.getAttribute("content")])
@@ -125,12 +114,10 @@ async function getStartFromTicketsolve(page) {
       }
     }
   } catch {}
-
   return null;
 }
 
 async function percentSoldFromTicketsolve(page) {
-  // If possible, pick a common "Stalls and Circles" option to render the seat-map
   try {
     const trigger =
       (await page.$('button:has-text("Select a zone")')) ||
@@ -191,11 +178,13 @@ async function scrapeListCards(page, pageNo) {
   const url = pageNo === 1 ? LIST_URL : `${LIST_URL}?_paged=${pageNo}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  return await page.$$eval("body", (body) => {
+  // FIX: use $eval so the callback receives the single <body> element
+  return await page.$eval("body", (body) => {
     const out = [];
+    if (!body) return out;
+
     const cards = body.querySelectorAll(".card-event, [class*='card-event'], article");
     for (const card of cards) {
-      // title
       let title =
         card.querySelector(".title")?.textContent?.trim() ||
         card.querySelector("h3, h2")?.textContent?.trim();
@@ -205,13 +194,11 @@ async function scrapeListCards(page, pageNo) {
       }
       if (!title) continue;
 
-      // date label on the card (e.g. "FRI 24 OCT 2025")
       const dateTxt =
         card.querySelector(".date")?.textContent?.trim() ||
         card.querySelector("[class*='date']")?.textContent?.trim() ||
         null;
 
-      // links
       const bookA =
         card.querySelector("a.cta.cta-primary") ||
         card.querySelector("a[href*='ticketsolve']") ||
@@ -242,13 +229,11 @@ async function getStartFromDmhInfo(page, url) {
     const iso = parseLongUkDateTime(text);
     if (iso) return iso;
 
-    // sometimes date & time are split; make a second attempt
-    // common pattern: "Fri 24 Oct 2025" … "7:30 pm"
     const d = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}/i);
     const t = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
     if (d && t) {
-      const isoFromCombined = parseLongUkDateTime(`${d[0]}, ${t[0]}`);
-      if (isoFromCombined) return isoFromCombined;
+      const iso2 = parseLongUkDateTime(`${d[0]}, ${t[0]}`);
+      if (iso2) return iso2;
     }
   } catch {}
   return null;
@@ -275,29 +260,22 @@ async function run() {
     const bookUrl = row.bookHref ? normaliseUrl(row.bookHref, "https://demontforthall.co.uk/") : null;
     const infoUrl = row.infoHref ? normaliseUrl(row.infoHref, "https://www.demontforthall.co.uk/") : null;
 
-    // 1) Ticketsolve (best)
     if (bookUrl) {
       try {
         await page.goto(bookUrl, { waitUntil: "domcontentloaded" });
-
-        // Get start
         startISO = await getStartFromTicketsolve(page);
 
-        // Quick sold out badge on ticketsolve
         const soldBadge = await page.$(":is(button, a, span):has-text('SOLD OUT')");
         if (soldBadge) pct = 100;
 
-        // Seat map percentage (if available)
         if (pct == null) pct = await percentSoldFromTicketsolve(page);
       } catch {}
     }
 
-    // 2) DMH info page (fallback for start date)
     if (!startISO && infoUrl) {
       startISO = await getStartFromDmhInfo(page, infoUrl);
     }
 
-    // 3) Card date only (ultimate fallback, default time 19:30)
     if (!startISO && row.dateTxt) {
       startISO = parseCardDateOnly(row.dateTxt);
     }
@@ -306,7 +284,7 @@ async function run() {
 
     results.push({
       title: row.title,
-      start: startISO,             // should now be non-null in the vast majority of cases
+      start: startISO,
       status: row.status,
       override_pct
     });
