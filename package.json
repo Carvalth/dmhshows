@@ -3,12 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "scrape": "node scrape-dmh.js",
+    "scrape": "node scripts/scrape-dmh.mjs",
     "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
     "dayjs": "^1.11.11",
-    "playwright": "^1.47.2",
-    "puppeteer": "^23.7.1"
+    "playwright": "^1.47.2"
   }
 }
