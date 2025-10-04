@@ -10,7 +10,7 @@ const OUT_PATH = path.join(ROOT, "public", "dmh-events.json");
 const LIST_URL = "https://www.demontforthall.co.uk/whats-on/";
 const MAX_PAGES = 12;
 
-/* ---------- helpers ---------- */
+/* ---------------- helpers ---------------- */
 
 function fallbackPct(statusText = "") {
   const s = statusText.toLowerCase();
@@ -21,31 +21,94 @@ function fallbackPct(statusText = "") {
   return 30;
 }
 
-async function waitLittle(page, ms = 600) {
-  await page.waitForTimeout(ms);
+async function sleep(ms = 500) {
+  await new Promise(r => setTimeout(r, ms));
 }
 
-async function parseJsonLdEventStart(page) {
-  // Ticketsolve pages usually include JSON-LD with "startDate"
-  const jsons = await page.$$eval('script[type="application/ld+json"]', nodes =>
+/* Parse "Friday 3 October 2025, 19:30" -> ISO */
+function parseUkDateTimeToISO(input) {
+  if (!input) return null;
+  const str = input.replace(/\s+/g, " ").trim();
+
+  // Fri 3 Oct 2025, 19:30  OR  Friday 03 October 2025, 7:30 PM
+  const re =
+    /(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?)\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}),\s+(\d{1,2}):(\d{2})(?:\s*(AM|PM))?/i;
+
+  const m = str.match(re);
+  if (!m) return null;
+
+  const day = parseInt(m[1], 10);
+  const monName = m[2].toLowerCase();
+  const year = parseInt(m[3], 10);
+  let hour = parseInt(m[4], 10);
+  const minute = parseInt(m[5], 10);
+  const ampm = (m[6] || "").toUpperCase();
+
+  const months = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+    jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+  };
+  const month = months[monName];
+  if (month == null) return null;
+
+  if (ampm) {
+    if (ampm === "PM" && hour < 12) hour += 12;
+    if (ampm === "AM" && hour === 12) hour = 0;
+  }
+
+  // Treat as Europe/London local then output ISO in UTC
+  // Using a naive approach is fine for our use-case.
+  const dt = new Date(Date.UTC(year, month, day, hour, minute, 0));
+  return dt.toISOString();
+}
+
+async function getStartISOFromTicketsolve(page) {
+  // 1) JSON-LD
+  const ld = await page.$$eval('script[type="application/ld+json"]', nodes =>
     nodes.map(n => n.textContent || "")
   );
-  for (const txt of jsons) {
+  for (const txt of ld) {
     try {
       const obj = JSON.parse(txt);
-      const maybe = Array.isArray(obj) ? obj : [obj];
-      for (const j of maybe) {
-        if (j["@type"] === "Event" && j.startDate) return new Date(j.startDate).toISOString();
-        if (j.event && j.event.startDate) return new Date(j.event.startDate).toISOString();
+      const arr = Array.isArray(obj) ? obj : [obj];
+      for (const j of arr) {
+        if (j["@type"] === "Event" && j.startDate) {
+          return new Date(j.startDate).toISOString();
+        }
+        if (j.event && j.event.startDate) {
+          return new Date(j.event.startDate).toISOString();
+        }
       }
     } catch {}
   }
+
+  // 2) Visible header text like: "Friday 3 October 2025, 19:30"
+  const headerTxt = await page
+    .$eval("body", el => el.innerText || "")
+    .catch(() => "");
+  const iso = parseUkDateTimeToISO(headerTxt);
+  if (iso) return iso;
+
+  // 3) Meta tags sometimes include date/time
+  const metas = await page.$$eval("meta", els =>
+    els.map(e => [e.getAttribute("property") || e.getAttribute("name"), e.getAttribute("content")])
+  );
+  for (const [k, v] of metas) {
+    if (!v) continue;
+    const guess = parseUkDateTimeToISO(v);
+    if (guess) return guess;
+    // Some installations put ISO already
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v)) {
+      try { return new Date(v).toISOString(); } catch {}
+    }
+  }
+
   return null;
 }
 
-// Try to count seats on the Ticketsolve seat map
 async function computePctSoldFromTicketsolve(page) {
-  // Pick a “complete” zone if there is a zone picker.
+  // Seat map only appears after a zone is selected on some installs
   try {
     const zoneBtn = await page.$('button:has-text("Select a zone"), [role="button"]:has-text("Select a zone"), button:has-text("Stalls and Circles")');
     if (zoneBtn) {
@@ -56,17 +119,15 @@ async function computePctSoldFromTicketsolve(page) {
         const first = await page.$('[role="listbox"] [role="option"], .select__menu [role="option"]');
         if (first) await first.click();
       }
+      await sleep(700);
     }
   } catch {}
-  await waitLittle(page);
 
-  // Count a variety of seat markups used by Ticketsolve skins
   const { available, unavailable } = await page.evaluate(() => {
-    const qAll = s => Array.from(document.querySelectorAll(s));
+    const q = s => Array.from(document.querySelectorAll(s));
     let available = 0, unavailable = 0;
 
-    // 1) data-seat-status attr
-    const byAttr = qAll("[data-seat-status]");
+    const byAttr = q("[data-seat-status]");
     for (const el of byAttr) {
       const st = (el.getAttribute("data-seat-status") || "").toLowerCase();
       if (st.includes("available")) available++;
@@ -74,18 +135,13 @@ async function computePctSoldFromTicketsolve(page) {
         unavailable++;
       }
     }
-
-    // 2) class patterns
     if (available + unavailable === 0) {
-      const av = qAll(".seat--available, .seat.available, .available.seat, [class*='seat'][class*='available']");
-      const un = qAll(".seat--unavailable, .seat.unavailable, .unavailable.seat, .seat.in-cart, .seat.selected, [class*='seat'][class*='unavailable']");
-      available = av.length;
-      unavailable = un.length;
+      const av = q(".seat--available, .seat.available, [class*='seat'][class*='available']");
+      const un = q(".seat--unavailable, .seat.unavailable, .seat.in-cart, .seat.selected, [class*='seat'][class*='unavailable']");
+      available = av.length; unavailable = un.length;
     }
-
-    // 3) aria label fallback
     if (available + unavailable === 0) {
-      const aria = qAll("[aria-label]");
+      const aria = q("[aria-label]");
       for (const el of aria) {
         const lab = (el.getAttribute("aria-label") || "").toLowerCase();
         if (lab.includes("available")) available++;
@@ -100,13 +156,12 @@ async function computePctSoldFromTicketsolve(page) {
   return Math.round((unavailable / total) * 100);
 }
 
-/* ---------- list page scraping ---------- */
+/* ---------------- list page ---------------- */
 
 async function scrapeListPage(page, pageNo) {
   const url = pageNo === 1 ? LIST_URL : `${LIST_URL}?_paged=${pageNo}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // A card always has a "BOOK NOW" or "SOLD OUT" button and a title block.
   const cards = await page.$$(
     ".card-event, [class*='card-event'], article:has(a:has-text('BOOK NOW')), article:has(.cta)"
   );
@@ -118,9 +173,6 @@ async function scrapeListPage(page, pageNo) {
       (await card.$eval("a[href*='/event/']", el => el.textContent?.trim()).catch(() => null));
     if (!title) continue;
 
-    const dateText = await card.$eval(".date", el => el.textContent?.trim()).catch(() => null);
-
-    // IMPORTANT: take PRIMARY action first (BOOK NOW/SOLD OUT), not "More info"
     const primary =
       (await card.$("a.cta.cta-primary")) ||
       (await card.$("a:has-text('BOOK NOW')")) ||
@@ -129,18 +181,17 @@ async function scrapeListPage(page, pageNo) {
 
     let status = "More info";
     let bookHref = null;
-
     if (primary) {
       status = (await primary.textContent())?.trim() || status;
       bookHref = await primary.getAttribute("href");
     }
 
-    rows.push({ title, dateText, status, bookHref });
+    rows.push({ title, status, bookHref });
   }
   return rows;
 }
 
-/* ---------- main ---------- */
+/* ---------------- main ---------------- */
 
 async function run() {
   const browser = await chromium.launch({ headless: true });
@@ -166,17 +217,17 @@ async function run() {
 
         await page.goto(href, { waitUntil: "domcontentloaded" });
 
-        // 1) precise start datetime via JSON-LD
-        startISO = await parseJsonLdEventStart(page);
+        // Get start (robust)
+        startISO = await getStartISOFromTicketsolve(page);
 
-        // 2) SOLD OUT on the tickets page => 100% (quick win)
+        // Quick SOLD OUT check
         const soldBadge = await page.$(":is(button, a, span):has-text('SOLD OUT')");
         if (soldBadge) pct = 100;
 
-        // 3) seat map % sold
+        // Seat map % sold if not already known
         if (pct === null) pct = await computePctSoldFromTicketsolve(page);
-      } catch (e) {
-        // ignore and fall back
+      } catch {
+        // fallbacks apply below
       }
     }
 
@@ -184,13 +235,13 @@ async function run() {
 
     out.push({
       title: r.title,
-      start: startISO || null, // we prefer Ticketsolve time; list page date is often missing time
+      start: startISO,       // <-- no longer null in normal cases
       status: r.status,
       override_pct
     });
   }
 
-  // Filter dupes (title + start)
+  // Dedup by title+start (start can still be null on some rare pages)
   const seen = new Set();
   const unique = out.filter(ev => {
     const key = `${ev.title}__${ev.start || ""}`;
@@ -210,4 +261,3 @@ run().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
