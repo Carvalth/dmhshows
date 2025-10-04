@@ -1,5 +1,5 @@
-// Scrape De Montfort Hall -> public/dmh-events.json
-// node scripts/scrape-dmh.mjs  (ensure "type": "module" in package.json if using .mjs)
+// scrape-dmh.js  — De Montfort Hall -> public/dmh-events.json
+// Node 18+; Playwright installed. If you use .mjs, set "type":"module" in package.json.
 
 import { chromium } from "playwright";
 import fs from "fs/promises";
@@ -174,11 +174,11 @@ function normaliseUrl(href, base) {
   try { return new URL(href, base).toString(); } catch { return href; }
 }
 
+// FIXED: no :has() / :contains() — we iterate links/buttons and inspect textContent
 async function scrapeListCards(page, pageNo) {
   const url = pageNo === 1 ? LIST_URL : `${LIST_URL}?_paged=${pageNo}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // FIX: use $eval so the callback receives the single <body> element
   return await page.$eval("body", (body) => {
     const out = [];
     if (!body) return out;
@@ -199,24 +199,42 @@ async function scrapeListCards(page, pageNo) {
         card.querySelector("[class*='date']")?.textContent?.trim() ||
         null;
 
-      const bookA =
-        card.querySelector("a.cta.cta-primary") ||
-        card.querySelector("a[href*='ticketsolve']") ||
-        card.querySelector("a:has(> span:contains('BOOK NOW'))");
+      let bookHref = null;
+      let infoHref = null;
+      let status = "More info";
 
-      const infoA =
-        card.querySelector("a.cta.cta-secondary") ||
-        card.querySelector("a[href*='/event/']");
+      // look through all buttons/links in the card
+      const clickable = card.querySelectorAll("a, button");
+      for (const el of clickable) {
+        const txt = (el.textContent || "").trim().toUpperCase();
+        const href = el.getAttribute("href") || "";
 
-      const status = (bookA?.textContent || infoA?.textContent || "More info").trim();
+        if (txt.includes("BOOK NOW")) {
+          bookHref = href || bookHref;
+          status = "BOOK NOW";
+        } else if (txt.includes("SOLD OUT")) {
+          // treat as status; some cards show SOLD OUT instead of book
+          status = "SOLD OUT";
+          if (!bookHref) bookHref = href; // sometimes still links through
+        } else if (txt.includes("MORE INFO")) {
+          infoHref = href || infoHref;
+          if (status === "More info") status = "More info";
+        } else if (!infoHref && href.includes("/event/")) {
+          infoHref = href;
+        }
+      }
 
-      out.push({
-        title,
-        dateTxt,
-        bookHref: bookA?.getAttribute("href") || null,
-        infoHref: infoA?.getAttribute("href") || null,
-        status
-      });
+      // fallback if we didn't see explicit buttons
+      if (!infoHref) {
+        const a = card.querySelector("a[href*='/event/']");
+        if (a) infoHref = a.getAttribute("href");
+      }
+      if (!bookHref) {
+        const a = card.querySelector("a[href*='ticketsolve']");
+        if (a) bookHref = a.getAttribute("href");
+      }
+
+      out.push({ title, dateTxt, bookHref, infoHref, status });
     }
     return out;
   });
