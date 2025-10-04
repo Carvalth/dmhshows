@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "scrape": "node scripts/scrape-dmh.mjs",
+    "scrape": "node scrape-dmh.mjs",
     "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
