@@ -7,7 +7,6 @@
     "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
-    "dayjs": "^1.11.11",
     "playwright": "^1.47.2"
   }
 }
