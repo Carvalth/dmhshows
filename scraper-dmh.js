@@ -63,6 +63,32 @@ async function withDeadline(promise, ms, label='task'){
 }
 
 /* ---------- time extraction helpers ---------- */
+async function sniffStartFromNetwork(page, baseY, baseM, baseD){
+  let found = null;
+  const onResp = async (resp) => {
+    try{
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!/json|text|javascript/.test(ct)) return;
+      const text = await resp.text();
+      if (!text) return;
+      // ISO-like first
+      found = found || findStartInISOish(text, baseY, baseM, baseD);
+      if (!found) {
+        // allow plain HH:MM if we also see the date nearby
+        if (text.includes(`${baseY}-${two(baseM)}-${two(baseD)}`)) {
+          found = findStartInTextOnly(text, baseY, baseM, baseD);
+        }
+      }
+    }catch{}
+  };
+  page.on('response', onResp);
+  // give it a short window to accumulate
+  await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+  await sleep(800);
+  page.off('response', onResp);
+  return found;
+}
+
 function extractTimePartsFromText(txt=''){
   // 24h HH:MM
   let m = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
@@ -79,6 +105,42 @@ function extractTimePartsFromText(txt=''){
   }
   return null;
 }
+function ymdFromUTCDate(d){
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth()+1, d: d.getUTCDate() };
+}
+const two = (n)=>String(n).padStart(2,'0');
+
+function findStartInISOish(text, y, m, d){
+  // e.g. 2025-10-06T19:30, 2025-10-06 19:30:00Z etc.
+  const datePat = `${y}-${two(m)}-${two(d)}`;
+  const mIso = text.match(new RegExp(`${datePat}[T\\s]([01]?\\d|2[0-3]):([0-5]\\d)`));
+  if (mIso){
+    const hh = parseInt(mIso[1],10), mi = parseInt(mIso[2],10);
+    const iso = new Date(`${datePat}T${two(hh)}:${two(mi)}:00`).toISOString();
+    return iso;
+  }
+  return null;
+}
+
+function findStartInTextOnly(text, y, m, d){
+  // fall back: any HH:MM or h:mm am/pm on the page
+  const m24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (m24){
+    const hh = parseInt(m24[1],10), mi = parseInt(m24[2],10);
+    return new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`).toISOString();
+  }
+  const m12 = text.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+  if (m12){
+    let hh = parseInt(m12[1],10);
+    const mi = m12[2] ? parseInt(m12[2],10) : 0;
+    const ap = m12[3].toLowerCase();
+    if (ap==='pm' && hh<12) hh+=12;
+    if (ap==='am' && hh===12) hh=0;
+    return new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`).toISOString();
+  }
+  return null;
+}
+
 const pad = (n) => String(n).padStart(2,'0');
 function makeISOFromLocalParts(y,m,d,h,mi){
   const local = new Date(`${y}-${pad(m)}-${pad(d)}T${pad(h)}:${pad(mi)}:00`);
@@ -86,16 +148,30 @@ function makeISOFromLocalParts(y,m,d,h,mi){
 }
 
 async function extractStartISOFromPage(page, baseY, baseM, baseD){
-  // <time datetime="...">
+  // 1) <time datetime="...">
   try{
     const t = await page.locator('time[datetime]').first().getAttribute('datetime');
-    if (t && /\dT\d/.test(t)) {
-      const iso = new Date(t).toISOString();
-      if (!isNaN(new Date(iso))) return iso;
+    if (t && /\dT\d/.test(t)) return new Date(t).toISOString();
+  }catch{}
+
+  // 2) obvious “time” UI bits (common templates)
+  try{
+    const tText = await page.evaluate(() => {
+      const pick = (sel) => Array.from(document.querySelectorAll(sel))
+        .map(n => (n.innerText || n.textContent || '').trim())
+        .filter(Boolean);
+      return [
+        ...pick('.event-time, .event__time, .performance-time, .showtime, .start-time, .time, .when, .details__time, [class*="time"]'),
+        ...pick('dl dt, dl dd, .meta, .event-meta, .performance-meta')
+      ].join('\n');
+    });
+    if (tText){
+      const iso = findStartInISOish(tText, baseY, baseM, baseD) || findStartInTextOnly(tText, baseY, baseM, baseD);
+      if (iso) return iso;
     }
   }catch{}
 
-  // schema.org JSON-LD
+  // 3) JSON-LD (schema.org)
   try{
     const blocks = await page.$$eval('script[type="application/ld+json"]', ss => ss.map(s => s.textContent || ''));
     for (const b of blocks){
@@ -103,60 +179,61 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
         const obj = JSON.parse(b);
         const arr = Array.isArray(obj) ? obj : [obj];
         for (const o of arr){
-          const sd = o && (o.startDate || o.start || o.start_time || (o.event && o.event.startDate));
-          if (sd){
-            const iso = new Date(sd).toISOString();
-            if (!isNaN(new Date(iso))) return iso;
-          }
+          const sd = o?.startDate || o?.start || o?.start_time || o?.event?.startDate;
+          if (sd) return new Date(sd).toISOString();
         }
       }catch{}
     }
   }catch{}
 
-  // free-text “19:00”, “7:30pm”, …
+  // 4) final: whole page text
   try{
     const txt = await page.evaluate(() => document.body.innerText || '');
-    const tm = extractTimePartsFromText(txt);
-    if (tm) {
-      const iso = makeISOFromLocalParts(baseY, baseM, baseD, tm.h, tm.m);
-      if (iso) return iso;
-    }
+    const iso = findStartInISOish(txt, baseY, baseM, baseD) || findStartInTextOnly(txt, baseY, baseM, baseD);
+    if (iso) return iso;
   }catch{}
 
   return null;
 }
 
+
 async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
   if (!currentStartISO) return null;
-  const d = new Date(currentStartISO);
-  const y = d.getUTCFullYear(), m = d.getUTCMonth()+1, day = d.getUTCDate();
+  const { y, m, d } = ymdFromUTCDate(new Date(currentStartISO));
 
-  // keep if it already has a time
-  const hh = d.getUTCHours(), mm = d.getUTCMinutes();
-  if (!(hh===0 && mm===0)) return currentStartISO;
+  // if already has a time, keep it
+  const dt = new Date(currentStartISO);
+  if (dt.getUTCHours() !== 0 || dt.getUTCMinutes() !== 0) return currentStartISO;
 
-  // try DMH event page
+  // Try DMH event page (DOM/JSON-LD/text)
   if (eventUrl){
     try{
       await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(()=>{});
-      const iso = await extractStartISOFromPage(page, y, m, day);
+      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
+      const iso = await extractStartISOFromPage(page, y, m, d);
       if (iso) return iso;
     }catch{}
   }
-  // try Ticketsolve seats
+
+  // Try Ticketsolve seats page (DOM + **network sniff**)
   if (ticketsUrl){
     let seatsUrl = ticketsUrl;
     if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
     try{
       await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(()=>{});
-      const iso = await extractStartISOFromPage(page, y, m, day);
+      // First the DOM patterns:
+      const iso = await extractStartISOFromPage(page, y, m, d);
       if (iso) return iso;
+      // Then the network payloads:
+      const nIso = await sniffStartFromNetwork(page, y, m, d);
+      if (nIso) return nIso;
     }catch{}
   }
-  return currentStartISO; // fallback
+
+  // fallback
+  return currentStartISO;
 }
+
 
 /* ---------- list crawling ---------- */
 async function expand(page) {
