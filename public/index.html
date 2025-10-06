@@ -102,6 +102,8 @@
 
   <script>
     const fmt = new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric'});
+    const fmtDateTime = new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    const fmtHM = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit'});
     const fmtShort = new Intl.DateTimeFormat(undefined,{month:'short',day:'2-digit'});
     function clamp(v,a,b){return Math.max(a,Math.min(b,Math.round(v)))}
     function pctSold(ev){ const n = Number(ev.override_pct); return Number.isFinite(n) ? clamp(n,0,100) : 0; }
@@ -131,15 +133,20 @@
       return cells;
     }
     function buildDayScores(events){
-      const map=new Map();
-      for(const ev of events){
-        if(!ev.start) continue;
-        const d=new Date(ev.start); const key=toLocalKey(d);
-        const pct=pctSold(ev);
-        map.set(key,(map.get(key)||[]).concat(pct));
-      }
-      return map;
-    }
+  const map=new Map(); // key -> {pcts:number[], times:string[]}
+  for(const ev of events){
+    if(!ev.start) continue;
+    const d=new Date(ev.start);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const pct = pctSold(ev);
+    const t   = fmtHM.format(d);
+    const cur = map.get(key) || {pcts:[], times:[]};
+    cur.pcts.push(pct);
+    cur.times.push(t);
+    map.set(key, cur);
+  }
+  return map;
+}
     function getColor(pct){
       if(pct>=99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
       if(pct>=75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
@@ -147,27 +154,42 @@
       return getComputedStyle(document.documentElement).getPropertyValue('--quiet');
     }
     function renderCalendar(){
-      calendar.innerHTML='';
-      const days=monthMatrix(state.month);
-      const dayOccs=buildDayScores(state.events);
-      const names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-      names.forEach(n=>{const w=document.createElement('div');w.className='weekday';w.textContent=n;calendar.appendChild(w);});
-      for(const d of days){
-        const cell=document.createElement('div');cell.className='day';
-        if(d){
-          const key=toLocalKey(d);
-          const arr=dayOccs.get(key)||[];
-          const avgPct=arr.length?Math.round(arr.reduce((a,b)=>a+b,0)/arr.length):0;
-          const dateEl=document.createElement('div');dateEl.className='date';dateEl.textContent=fmtShort.format(d);
-          const bar=document.createElement('div');bar.className='bar';
-          bar.style.background=`linear-gradient(90deg, ${getColor(avgPct)} ${avgPct}%, #253136 ${avgPct}%)`;
-          const tag=document.createElement('span');tag.className='tag';
-          tag.textContent=`${avgPct}% sold${arr.length?' · '+arr.length+' show'+(arr.length>1?'s':''):''}`;
-          cell.appendChild(dateEl);cell.appendChild(bar);cell.appendChild(tag);
-        } else { cell.style.visibility='hidden'; }
-        calendar.appendChild(cell);
+  calendar.innerHTML='';
+  const days=monthMatrix(state.month);
+  const dayOccs=buildDayScores(state.events);
+  const names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  names.forEach(n=>{const w=document.createElement('div');w.className='weekday';w.textContent=n;calendar.appendChild(w);});
+  for(const d of days){
+    const cell=document.createElement('div');cell.className='day';
+    if(d){
+      const key = toLocalKey(d);
+      const dayInfo = dayOccs.get(key) || {pcts:[],times:[]};
+      const avgPct = dayInfo.pcts.length ? Math.round(dayInfo.pcts.reduce((a,b)=>a+b,0)/dayInfo.pcts.length) : 0;
+
+      const dateEl=document.createElement('div');dateEl.className='date';dateEl.textContent=fmtShort.format(d);
+      const bar=document.createElement('div');bar.className='bar';
+      bar.style.background=`linear-gradient(90deg, ${getColor(avgPct)} ${avgPct}%, #253136 ${avgPct}%)`;
+
+      const tag=document.createElement('span');tag.className='tag';
+      tag.textContent=`${avgPct}% sold${dayInfo.pcts.length?' · '+dayInfo.pcts.length+' show'+(dayInfo.pcts.length>1?'s':''):''}`;
+
+      cell.appendChild(dateEl);
+      cell.appendChild(bar);
+      cell.appendChild(tag);
+
+      if (dayInfo.times.length){
+        const timesEl=document.createElement('div');
+        timesEl.className='meta';
+        timesEl.style.fontSize='11px';
+        timesEl.textContent = dayInfo.times.join(', ');
+        cell.appendChild(timesEl);
       }
+    } else {
+      cell.style.visibility='hidden';
     }
+    calendar.appendChild(cell);
+  }
+}
     function renderEvents(){
       eventsEl.innerHTML='';
       const sortSel = document.getElementById('sortSelect');
@@ -179,7 +201,10 @@
         const wrap=document.createElement('div');wrap.className='event';
         const left=document.createElement('div');const right=document.createElement('div');
         const title=document.createElement('div');title.className='title';title.textContent=ev.title||'';
-        const when=document.createElement('div');when.className='meta';when.textContent=ev.start?fmt.format(new Date(ev.start)):'';
+        const when = document.createElement('div');
+when.className = 'meta';
+when.textContent = ev.start ? fmtDateTime.format(new Date(ev.start)) : '';
+
         const pill=document.createElement('span');pill.className='pill';pill.textContent=ev.status||'';
         const pctEl=document.createElement('span');pctEl.className='pill';pctEl.style.marginLeft='6px';pctEl.textContent=`${pctSold(ev)}% sold`;
         left.appendChild(title);left.appendChild(when); right.appendChild(pill); right.appendChild(pctEl);
