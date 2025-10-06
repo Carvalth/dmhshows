@@ -1,0 +1,12 @@
+{
+  "name": "dmh-scraper",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "scrape": "node scraper-dmh.js",
+    "dev-serve": "npx http-server ./public -p 5173 -c-1"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
