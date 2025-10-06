@@ -1,4 +1,3 @@
-// scraper-dmh.js
 import { chromium } from 'playwright';
 import fs from 'fs/promises';
 import path from 'path';
@@ -6,10 +5,11 @@ import os from 'os';
 
 const LIST_URL = 'https://demontforthall.co.uk/whats-on/';
 const OUT_FILE = path.join('public', 'dmh-events.json');
+const DIAG_DIR = 'diagnostics';
 
 const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
-const TIMEOUT = 45000;
-const NET_IDLE = 3500;
+const TIMEOUT = 60000;
+const NET_IDLE = 4500;
 const CONCURRENCY = 3;
 
 /* ---------- helpers ---------- */
@@ -33,6 +33,8 @@ const toISO = (v) => { const d = new Date(v); return Number.isNaN(d.getTime()) ?
 const isHttp = (u) => /^https?:\/\//i.test(u);
 const isWhatsOn = (u) => /^https?:\/\/[^/]*demontforthall\.co\.uk\/whats-on\//i.test(u);
 
+async function ensureDir(p){ await fs.mkdir(p, { recursive: true }).catch(()=>{}); }
+
 /* ---------- list crawling ---------- */
 
 async function expand(page) {
@@ -47,18 +49,15 @@ async function expand(page) {
   }
 }
 
-// NEW: only return real "What's On" pagination URLs
 async function collectPaginationUrls(page) {
   const urls = new Set([LIST_URL]);
 
-  // numbers in pagination
   const nums = await page.$$eval('a.page-numbers, nav a', as =>
     as.map(a => parseInt((a.textContent || '').trim(), 10)).filter(Number.isFinite)
   );
   const maxNum = nums.length ? Math.max(...nums) : 1;
   for (let p = 2; p <= maxNum; p++) urls.add(new URL(`/whats-on/page/${p}/`, LIST_URL).href);
 
-  // also capture explicit links that look like paging
   const anchors = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href')));
   for (const href of anchors) {
     if (!href) continue;
@@ -127,16 +126,15 @@ async function findTicketsolveOnEventPage(page, eventUrl) {
   return '';
 }
 
-/* ---------- Ticketsolve seat extraction ---------- */
+/* ---------- seat payload parsing ---------- */
 
-// Robust JSON scanner – counts any object that looks like a seat with availability info
+// Heuristic seat summarizer: crawl any structure and count capacity/available.
 function summariseSeatPayload(data) {
   let cap = 0, avail = 0;
   const seen = new Set();
   const visit = (node) => {
     if (!node || typeof node !== 'object') return;
     if (seen.has(node)) return; seen.add(node);
-
     if (Array.isArray(node)) { node.forEach(visit); return; }
 
     const keys = Object.keys(node);
@@ -156,40 +154,93 @@ function summariseSeatPayload(data) {
   return { cap, avail };
 }
 
-async function extractAvailabilityFromNetwork(page) {
-  const payloads = [];
-  const handler = async (resp) => {
+/* capture network + websockets, write diagnostics, and expose the best summary seen */
+async function tapAvailability(page, diagId) {
+  const hits = [];
+  const diag = { responses: [], ws: [] };
+
+  page.on('response', async (resp) => {
     try {
       const url = resp.url();
-      // only JSON/XHR relevant to seats
-      if (!/events?\/\d+\/(seats|availability|seatmap)|seat|avail|inventory|map/i.test(url)) return;
-      const ct = resp.headers()['content-type'] || '';
-      if (!/json|javascript/i.test(ct)) return;
-      const data = await resp.json();
+      const type = resp.request().resourceType();
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!/json|javascript|text/.test(ct) && !/xhr|fetch/.test(type)) return;
+
+      const text = await resp.text();
+      if (!text) return;
+
+      // Save for diagnostics
+      diag.responses.push({ url, ct, type, size: text.length });
+
+      // Try JSON parse; fall back to embedded JSON detection
+      let data = null;
+      try { data = JSON.parse(text); } catch {
+        const m = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+        if (m) { try { data = JSON.parse(m[0]); } catch {} }
+      }
+      if (!data) return;
+
       const sum = summariseSeatPayload(data);
-      if (sum.cap > 0) payloads.push(sum);
+      if (sum.cap > 0) hits.push(sum);
     } catch {}
-  };
-  page.on('response', handler);
+  });
+
+  page.on('websocket', ws => {
+    const rec = { url: ws.url(), frames: [] };
+    diag.ws.push(rec);
+    ws.on('framereceived', data => {
+      rec.frames.push({ in: true, size: (data||'').length });
+      try {
+        const obj = JSON.parse(data);
+        const sum = summariseSeatPayload(obj);
+        if (sum.cap > 0) hits.push(sum);
+      } catch {}
+    });
+    ws.on('framesent', data => { rec.frames.push({ out: true, size: (data||'').length }); });
+  });
+
   return {
-    stop: () => page.off('response', handler),
-    read: () => {
-      if (!payloads.length) return null;
-      // merge all
-      const total = payloads.reduce((a,b)=>({cap:a.cap+b.cap, avail:a.avail+b.avail}), {cap:0, avail:0});
-      return total.cap > 0 ? total : null;
+    best: () => {
+      if (!hits.length) return null;
+      // merge the largest capacity snapshot we’ve seen
+      const best = hits.reduce((a,b) => (b.cap > a.cap ? b : a), { cap:0, avail:0 });
+      return best;
+    },
+    async flush() {
+      await ensureDir(DIAG_DIR);
+      await fs.writeFile(path.join(DIAG_DIR, `${diagId}.json`), JSON.stringify(diag, null, 2));
     }
   };
 }
 
+/* activate seat map reliably */
+async function activateSeatMap(page) {
+  // cookie consent (common on Ticketsolve)
+  const consent = page.locator('button:has-text("Accept") , button:has-text("I Agree"), button[aria-label*="accept" i]');
+  if (await consent.count()) { await consent.first().click().catch(()=>{}); }
+
+  // bring seatmap into view
+  const seatCanvas = page.locator('canvas, [id*="seat"], [class*="seatmap"], svg');
+  if (await seatCanvas.count()) await seatCanvas.first().scrollIntoViewIfNeeded().catch(()=>{});
+
+  // choose a price type if needed (activates availability)
+  const price = page.locator('label:has-text("Full") , [for*="Full"], [role="radio"]:has-text("Full")');
+  if (await price.count()) await price.first().click().catch(()=>{});
+
+  // open zone/section list once (loads per-zone availability endpoints)
+  const listbox = page.locator('[role="listbox"], select');
+  if (await listbox.count()) { await listbox.first().click().catch(()=>{}); await page.keyboard.press('Escape').catch(()=>{}); }
+
+  await page.waitForLoadState('networkidle', { timeout: NET_IDLE }).catch(()=>{});
+  await sleep(600);
+}
+
 async function selectZone(page, zoneText, zoneValue) {
-  // native <select>
   const sel = page.locator('select');
   if (await sel.count()) {
     try {
-      if (zoneValue) {
-        await sel.selectOption(zoneValue);
-      } else {
+      if (zoneValue) await sel.selectOption(zoneValue);
+      else {
         const value = await sel.evaluate((s, txt) => {
           const t = (txt || '').toLowerCase();
           const opt = Array.from(s.options).find(o => (o.textContent || '').toLowerCase().includes(t));
@@ -200,7 +251,6 @@ async function selectZone(page, zoneText, zoneValue) {
       return true;
     } catch {}
   }
-  // custom listbox
   const listBox = page.locator('[role="listbox"]');
   if (await listBox.count()) {
     try {
@@ -235,7 +285,6 @@ async function readZones(page) {
   return [];
 }
 
-// last-ditch DOM heuristic (may be 0 if canvas only)
 async function countSeatsNow(page) {
   return await page.evaluate(() => {
     const seats = Array.from(document.querySelectorAll(
@@ -263,46 +312,47 @@ async function countSeatsNow(page) {
   });
 }
 
-async function computeTicketsolvePct(page, url) {
+async function computeTicketsolvePct(page, url, diagName) {
   let seatsUrl = url;
   if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
 
-  // capture network JSON the seatmap fetches
-  const tap = await extractAvailabilityFromNetwork(page);
+  const tap = await tapAvailability(page, diagName);
 
   try {
     await page.goto(seatsUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
-  } catch { tap.stop(); return null; }
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+  } catch { await tap.flush(); return null; }
 
-  // if we saw API payloads already, use them
-  let net = tap.read();
-  if (net && net.cap > 0) {
-    tap.stop();
-    const sold = net.cap - net.avail;
-    const pct = clamp(round((sold / net.cap) * 100), 0, 100);
-    return { capacity: net.cap, remaining: net.avail, sold, pct };
+  await activateSeatMap(page);
+
+  // first try: any network payload already?
+  let best = tap.best();
+  if (best && best.cap > 0) {
+    await tap.flush();
+    const sold = best.cap - best.avail;
+    const pct = clamp(round((sold / best.cap) * 100), 0, 100);
+    return { capacity: best.cap, remaining: best.avail, sold, pct };
   }
 
-  // else: iterate zones and keep listening (some endpoints load per-zone)
+  // else iterate zones; some APIs fire per-zone
   let zones = await readZones(page);
   if (!zones.length) zones = [{ text: 'All', value: null }];
-  let totalCap = 0, totalAvail = 0;
 
+  let totalCap = 0, totalAvail = 0;
   for (const z of zones) {
     await selectZone(page, z.text, z.value).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: NET_IDLE }).catch(() => {});
-    await sleep(350);
+    await sleep(600);
 
-    // prefer network payload if it appeared
-    net = tap.read();
-    if (net && net.cap > 0) { totalCap = net.cap; totalAvail = net.avail; break; }
+    best = tap.best();
+    if (best && best.cap > 0) { totalCap = best.cap; totalAvail = best.avail; break; }
 
-    // fallback DOM probe
+    // last-ditch DOM probe
     const { cap, avail } = await countSeatsNow(page);
     if (cap > 0) { totalCap += cap; totalAvail += avail; }
   }
-  tap.stop();
+
+  await tap.flush();
 
   if (totalCap > 0) {
     const sold = totalCap - totalAvail;
@@ -315,6 +365,9 @@ async function computeTicketsolvePct(page, url) {
 /* ---------- main ---------- */
 
 async function main() {
+  await ensureDir(path.dirname(OUT_FILE));
+  await ensureDir(DIAG_DIR);
+
   const browser = await chromium.launch({ headless: HEADLESS });
   const context = await browser.newContext({
     userAgent: `Mozilla/5.0 (${os.platform()}; ${os.arch()}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36`
@@ -323,10 +376,9 @@ async function main() {
   try {
     const p0 = await context.newPage();
     await p0.goto(LIST_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await p0.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
+    await p0.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
     await expand(p0);
-    const pageUrls = (await collectPaginationUrls(p0))
-      .filter(u => isHttp(u) && isWhatsOn(u)); // <-- prevent tel:, mailto:, javascript:
+    const pageUrls = (await collectPaginationUrls(p0)).filter(u => isHttp(u) && isWhatsOn(u));
     await p0.close();
 
     const raw = [];
@@ -334,7 +386,7 @@ async function main() {
       const p = await context.newPage();
       try {
         await p.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-        await p.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
+        await p.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         await expand(p);
         raw.push(...await extractCardsFromPage(p));
       } catch (e) {
@@ -343,7 +395,6 @@ async function main() {
     }
     const cards = uniqBy(raw, x => `${x.title}|${x.datetime || x.dateText}`);
 
-    // pool of pages for concurrent Ticketsolve work
     const tsPages = [];
     for (let i = 0; i < CONCURRENCY; i++) tsPages.push(await context.newPage());
 
@@ -362,9 +413,11 @@ async function main() {
       let pct = null;
       if (tickets) {
         try {
-          const r = await computeTicketsolvePct(p, tickets);
+          const r = await computeTicketsolvePct(p, tickets, `${(c.title||'event').slice(0,60).replace(/[^\w\-]+/g,'_')}-${start||'no-date'}`);
           if (r?.pct != null) pct = r.pct;
-        } catch {}
+        } catch (e) {
+          console.warn('Ticketsolve failed', c.title, e.message);
+        }
       }
       if (pct == null) pct = statusToPct(c.status);
 
@@ -377,9 +430,9 @@ async function main() {
     }
 
     const final = uniqBy(out, x => `${x.title}|${x.start}|${x.override_pct}`);
-    await fs.mkdir(path.dirname(OUT_FILE), { recursive: true });
     await fs.writeFile(OUT_FILE, JSON.stringify(final, null, 2), 'utf8');
     console.log(`Wrote ${final.length} events → ${OUT_FILE}`);
+    console.log(`Diagnostics saved in: ./${DIAG_DIR}/ (one JSON per event)`);
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
