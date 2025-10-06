@@ -35,6 +35,102 @@ const isWhatsOn = (u) => /^https?:\/\/[^/]*demontforthall\.co\.uk\/whats-on\//i.
 
 async function ensureDir(p){ await fs.mkdir(p, { recursive: true }).catch(()=>{}); }
 
+/* ---------- time extraction helpers (NEW) ---------- */
+function extractTimePartsFromText(txt=''){
+  // 24h HH:MM
+  let m = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (m) return { h: parseInt(m[1],10), m: parseInt(m[2],10) };
+  // 12h h(:mm)? am/pm
+  m = txt.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+  if (m){
+    let h = parseInt(m[1],10);
+    let mi = m[2] ? parseInt(m[2],10) : 0;
+    const ap = m[3].toLowerCase();
+    if (ap==='pm' && h<12) h+=12;
+    if (ap==='am' && h===12) h=0;
+    return { h, m: mi };
+  }
+  return null;
+}
+const pad = (n) => String(n).padStart(2,'0');
+function makeISOFromLocalParts(y,m,d,h,mi){
+  const local = new Date(`${y}-${pad(m)}-${pad(d)}T${pad(h)}:${pad(mi)}:00`);
+  return isNaN(local.getTime()) ? null : local.toISOString();
+}
+
+async function extractStartISOFromPage(page, baseY, baseM, baseD){
+  // <time datetime="...">
+  try{
+    const t = await page.locator('time[datetime]').first().getAttribute('datetime');
+    if (t && /\dT\d/.test(t)) {
+      const iso = new Date(t).toISOString();
+      if (!isNaN(new Date(iso))) return iso;
+    }
+  }catch{}
+
+  // schema.org JSON-LD
+  try{
+    const blocks = await page.$$eval('script[type="application/ld+json"]', ss => ss.map(s => s.textContent || ''));
+    for (const b of blocks){
+      try{
+        const obj = JSON.parse(b);
+        const arr = Array.isArray(obj) ? obj : [obj];
+        for (const o of arr){
+          const sd = o && (o.startDate || o.start || o.start_time || (o.event && o.event.startDate));
+          if (sd){
+            const iso = new Date(sd).toISOString();
+            if (!isNaN(new Date(iso))) return iso;
+          }
+        }
+      }catch{}
+    }
+  }catch{}
+
+  // free-text “19:00”, “7:30pm”, etc.
+  try{
+    const txt = await page.evaluate(() => document.body.innerText || '');
+    const tm = extractTimePartsFromText(txt);
+    if (tm) {
+      const iso = makeISOFromLocalParts(baseY, baseM, baseD, tm.h, tm.m);
+      if (iso) return iso;
+    }
+  }catch{}
+
+  return null;
+}
+
+async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
+  if (!currentStartISO) return null;
+  const d = new Date(currentStartISO);
+  const y = d.getUTCFullYear(), m = d.getUTCMonth()+1, day = d.getUTCDate();
+
+  // keep if not midnight already
+  const hh = d.getUTCHours(), mm = d.getUTCMinutes();
+  if (!(hh===0 && mm===0)) return currentStartISO;
+
+  // try DMH event page
+  if (eventUrl){
+    try{
+      await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(()=>{});
+      const iso = await extractStartISOFromPage(page, y, m, day);
+      if (iso) return iso;
+    }catch{}
+  }
+  // try Ticketsolve seats
+  if (ticketsUrl){
+    let seatsUrl = ticketsUrl;
+    if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
+    try{
+      await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(()=>{});
+      const iso = await extractStartISOFromPage(page, y, m, day);
+      if (iso) return iso;
+    }catch{}
+  }
+  return currentStartISO; // fallback: leave midnight
+}
+
 /* ---------- list crawling ---------- */
 
 async function expand(page) {
@@ -202,7 +298,6 @@ async function tapAvailability(page, diagId) {
   return {
     best: () => {
       if (!hits.length) return null;
-      // merge the largest capacity snapshot we’ve seen
       const best = hits.reduce((a,b) => (b.cap > a.cap ? b : a), { cap:0, avail:0 });
       return best;
     },
@@ -215,19 +310,15 @@ async function tapAvailability(page, diagId) {
 
 /* activate seat map reliably */
 async function activateSeatMap(page) {
-  // cookie consent (common on Ticketsolve)
   const consent = page.locator('button:has-text("Accept") , button:has-text("I Agree"), button[aria-label*="accept" i]');
   if (await consent.count()) { await consent.first().click().catch(()=>{}); }
 
-  // bring seatmap into view
   const seatCanvas = page.locator('canvas, [id*="seat"], [class*="seatmap"], svg');
   if (await seatCanvas.count()) await seatCanvas.first().scrollIntoViewIfNeeded().catch(()=>{});
 
-  // choose a price type if needed (activates availability)
   const price = page.locator('label:has-text("Full") , [for*="Full"], [role="radio"]:has-text("Full")');
   if (await price.count()) await price.first().click().catch(()=>{});
 
-  // open zone/section list once (loads per-zone availability endpoints)
   const listbox = page.locator('[role="listbox"], select');
   if (await listbox.count()) { await listbox.first().click().catch(()=>{}); await page.keyboard.press('Escape').catch(()=>{}); }
 
@@ -408,7 +499,15 @@ async function main() {
         tickets = await findTicketsolveOnEventPage(p, c.eventHref);
       }
 
-      const start = (c.datetime && toISO(c.datetime)) || (c.dateText && toISO(c.dateText)) || null;
+      let start = (c.datetime && toISO(c.datetime)) || (c.dateText && toISO(c.dateText)) || null;
+
+      // NEW: refine start time (get real HH:MM)
+      try {
+        if (start) {
+          const refined = await discoverStartISO(p, start, c.eventHref, tickets);
+          if (refined) start = refined;
+        }
+      } catch {}
 
       let pct = null;
       if (tickets) {
