@@ -7,10 +7,30 @@ const LIST_URL = 'https://demontforthall.co.uk/whats-on/';
 const OUT_FILE = path.join('public', 'dmh-events.json');
 const DIAG_DIR = 'diagnostics';
 
-const HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
+// allow override via --headless=false
+let HEADLESS = (process.env.HEADLESS ?? 'true') !== 'false';
 const TIMEOUT = 60000;
 const NET_IDLE = 4500;
 const CONCURRENCY = 3;
+
+/* ---------------- CLI knobs ----------------
+   --limit=20          only process first N events
+   --from=2025-10-01   only events on/after this (ISO date)
+   --to=2025-12-31     only events on/before this (ISO date)
+   --perEventMs=25000  watchdog per event
+   --headless=false    show the browser
+*/
+const argv = Object.fromEntries(
+  process.argv.slice(2).map(a => {
+    const [k, v] = a.replace(/^--/, '').split('=');
+    return [k, v === undefined ? true : v];
+  })
+);
+const LIMIT        = Number.isFinite(+argv.limit) ? +argv.limit : Infinity;
+const FROM_DATE    = argv.from ? new Date(argv.from) : null;
+const TO_DATE      = argv.to ? new Date(argv.to) : null;
+const PER_EVENT_MS = Number.isFinite(+argv.perEventMs) ? +argv.perEventMs : 25000;
+if (typeof argv.headless === 'string') HEADLESS = argv.headless !== 'false';
 
 /* ---------- helpers ---------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -35,7 +55,14 @@ const isWhatsOn = (u) => /^https?:\/\/[^/]*demontforthall\.co\.uk\/whats-on\//i.
 
 async function ensureDir(p){ await fs.mkdir(p, { recursive: true }).catch(()=>{}); }
 
-/* ---------- time extraction helpers (NEW) ---------- */
+async function withDeadline(promise, ms, label='task'){
+  return Promise.race([
+    promise,
+    (async()=>{ await sleep(ms); throw new Error(`timeout: ${label} after ${ms}ms`); })()
+  ]);
+}
+
+/* ---------- time extraction helpers ---------- */
 function extractTimePartsFromText(txt=''){
   // 24h HH:MM
   let m = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
@@ -86,7 +113,7 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
     }
   }catch{}
 
-  // free-text “19:00”, “7:30pm”, etc.
+  // free-text “19:00”, “7:30pm”, …
   try{
     const txt = await page.evaluate(() => document.body.innerText || '');
     const tm = extractTimePartsFromText(txt);
@@ -104,7 +131,7 @@ async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
   const d = new Date(currentStartISO);
   const y = d.getUTCFullYear(), m = d.getUTCMonth()+1, day = d.getUTCDate();
 
-  // keep if not midnight already
+  // keep if it already has a time
   const hh = d.getUTCHours(), mm = d.getUTCMinutes();
   if (!(hh===0 && mm===0)) return currentStartISO;
 
@@ -128,11 +155,10 @@ async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
       if (iso) return iso;
     }catch{}
   }
-  return currentStartISO; // fallback: leave midnight
+  return currentStartISO; // fallback
 }
 
 /* ---------- list crawling ---------- */
-
 async function expand(page) {
   let prev = -1;
   for (let i = 0; i < 8; i++) {
@@ -181,7 +207,8 @@ async function extractCardsFromPage(page) {
       const datetime = timeEl?.getAttribute?.('datetime') || '';
       const dateText = datetime || T(timeEl);
 
-      let status = ''; let ticketsHref = '';
+      let status = '', ticketsHref = '', eventHref = '';
+
       const ctas = Array.from(n.querySelectorAll('a,button,span')).filter(isCTA);
       const pref = ctas.find(el => goodStatus(T(el))) || ctas.find(el => /book|sold|limited/i.test(T(el)));
       if (pref) {
@@ -193,12 +220,18 @@ async function extractCardsFromPage(page) {
         if (ts) ticketsHref = ts.getAttribute('href') || '';
       }
 
-      let eventHref = '';
       const more = n.querySelector('a[href*="/event/"], a[href*="/events/"], a[href*="/event-"]');
       if (more) eventHref = more.getAttribute('href') || '';
 
       const abs = (u) => { try { return new URL(u, location.href).href; } catch { return u; } };
-      items.push({ title, datetime, dateText, status, ticketsHref: ticketsHref ? abs(ticketsHref) : '', eventHref: eventHref ? abs(eventHref) : '' });
+      items.push({
+        title,
+        datetime,
+        dateText,
+        status,
+        ticketsHref: ticketsHref ? abs(ticketsHref) : '',
+        eventHref: eventHref ? abs(eventHref) : ''
+      });
     }
     return items;
   });
@@ -223,8 +256,6 @@ async function findTicketsolveOnEventPage(page, eventUrl) {
 }
 
 /* ---------- seat payload parsing ---------- */
-
-// Heuristic seat summarizer: crawl any structure and count capacity/available.
 function summariseSeatPayload(data) {
   let cap = 0, avail = 0;
   const seen = new Set();
@@ -233,7 +264,6 @@ function summariseSeatPayload(data) {
     if (seen.has(node)) return; seen.add(node);
     if (Array.isArray(node)) { node.forEach(visit); return; }
 
-    const keys = Object.keys(node);
     const looksLikeSeat = (
       ('seat' in node || 'seatId' in node || 'id' in node || 'x' in node || 'row' in node) &&
       ('available' in node || 'isAvailable' in node || 'status' in node || 'state' in node)
@@ -244,13 +274,12 @@ function summariseSeatPayload(data) {
       const a = node.available ?? node.isAvailable;
       if (a === true || /available|free|open/.test(s)) avail += 1;
     }
-    for (const k of keys) visit(node[k]);
+    for (const k of Object.keys(node)) visit(node[k]);
   };
   visit(data);
   return { cap, avail };
 }
 
-/* capture network + websockets, write diagnostics, and expose the best summary seen */
 async function tapAvailability(page, diagId) {
   const hits = [];
   const diag = { responses: [], ws: [] };
@@ -265,10 +294,8 @@ async function tapAvailability(page, diagId) {
       const text = await resp.text();
       if (!text) return;
 
-      // Save for diagnostics
       diag.responses.push({ url, ct, type, size: text.length });
 
-      // Try JSON parse; fall back to embedded JSON detection
       let data = null;
       try { data = JSON.parse(text); } catch {
         const m = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
@@ -298,8 +325,7 @@ async function tapAvailability(page, diagId) {
   return {
     best: () => {
       if (!hits.length) return null;
-      const best = hits.reduce((a,b) => (b.cap > a.cap ? b : a), { cap:0, avail:0 });
-      return best;
+      return hits.reduce((a,b) => (b.cap > a.cap ? b : a), { cap:0, avail:0 });
     },
     async flush() {
       await ensureDir(DIAG_DIR);
@@ -416,7 +442,6 @@ async function computeTicketsolvePct(page, url, diagName) {
 
   await activateSeatMap(page);
 
-  // first try: any network payload already?
   let best = tap.best();
   if (best && best.cap > 0) {
     await tap.flush();
@@ -425,7 +450,6 @@ async function computeTicketsolvePct(page, url, diagName) {
     return { capacity: best.cap, remaining: best.avail, sold, pct };
   }
 
-  // else iterate zones; some APIs fire per-zone
   let zones = await readZones(page);
   if (!zones.length) zones = [{ text: 'All', value: null }];
 
@@ -438,7 +462,6 @@ async function computeTicketsolvePct(page, url, diagName) {
     best = tap.best();
     if (best && best.cap > 0) { totalCap = best.cap; totalAvail = best.avail; break; }
 
-    // last-ditch DOM probe
     const { cap, avail } = await countSeatsNow(page);
     if (cap > 0) { totalCap += cap; totalAvail += avail; }
   }
@@ -454,7 +477,6 @@ async function computeTicketsolvePct(page, url, diagName) {
 }
 
 /* ---------- main ---------- */
-
 async function main() {
   await ensureDir(path.dirname(OUT_FILE));
   await ensureDir(DIAG_DIR);
@@ -484,7 +506,23 @@ async function main() {
         console.warn('List page failed', url, e.message);
       } finally { await p.close().catch(() => {}); }
     }
-    const cards = uniqBy(raw, x => `${x.title}|${x.datetime || x.dateText}`);
+    let cards = uniqBy(raw, x => `${x.title}|${x.datetime || x.dateText}`);
+
+    // date window + limit
+    const getDateISO = (c) => (c.datetime && toISO(c.datetime)) || (c.dateText && toISO(c.dateText)) || null;
+    if (FROM_DATE || TO_DATE) {
+      cards = cards.filter(c => {
+        const iso = getDateISO(c);
+        if (!iso) return true;
+        const d = new Date(iso);
+        if (FROM_DATE && d < FROM_DATE) return false;
+        if (TO_DATE && d > TO_DATE) return false;
+        return true;
+      });
+    }
+    if (isFinite(LIMIT)) cards = cards.slice(0, LIMIT);
+
+    console.log(`Discovered ${cards.length} events across ${pageUrls.length} pages`);
 
     const tsPages = [];
     for (let i = 0; i < CONCURRENCY; i++) tsPages.push(await context.newPage());
@@ -494,31 +532,45 @@ async function main() {
       const c = cards[i];
       const p = tsPages[i % CONCURRENCY];
 
+      console.log(`[${i+1}/${cards.length}] ${c.title}`);
+
       let tickets = c.ticketsHref;
       if ((!tickets || !/ticketsolve/i.test(tickets)) && c.eventHref) {
-        tickets = await findTicketsolveOnEventPage(p, c.eventHref);
+        try {
+          tickets = await withDeadline(findTicketsolveOnEventPage(p, c.eventHref), PER_EVENT_MS, 'findTicketsolveOnEventPage');
+        } catch (e) {
+          console.warn('  ⚠︎ ticketsolve discovery:', e.message);
+        }
       }
 
-      let start = (c.datetime && toISO(c.datetime)) || (c.dateText && toISO(c.dateText)) || null;
+      let start = getDateISO(c);
 
-      // NEW: refine start time (get real HH:MM)
+      // refine start time
       try {
         if (start) {
-          const refined = await discoverStartISO(p, start, c.eventHref, tickets);
+          const refined = await withDeadline(discoverStartISO(p, start, c.eventHref, tickets), PER_EVENT_MS, 'discoverStartISO');
           if (refined) start = refined;
         }
-      } catch {}
+      } catch (e) {
+        console.warn('  ⚠︎ time refine:', e.message);
+      }
 
       let pct = null;
       if (tickets) {
         try {
-          const r = await computeTicketsolvePct(p, tickets, `${(c.title||'event').slice(0,60).replace(/[^\w\-]+/g,'_')}-${start||'no-date'}`);
+          const r = await withDeadline(
+            computeTicketsolvePct(p, tickets, `${(c.title||'event').slice(0,60).replace(/[^\w\-]+/g,'_')}-${start||'no-date'}`),
+            PER_EVENT_MS,
+            'computeTicketsolvePct'
+          );
           if (r?.pct != null) pct = r.pct;
         } catch (e) {
-          console.warn('Ticketsolve failed', c.title, e.message);
+          console.warn('  ⚠︎ seat count:', e.message);
         }
       }
       if (pct == null) pct = statusToPct(c.status);
+
+      console.log(`  ↳ ${pct}% sold${start ? ' • ' + start : ''}`);
 
       out.push({
         title: c.title,
