@@ -29,7 +29,7 @@ const argv = Object.fromEntries(
 const LIMIT        = Number.isFinite(+argv.limit) ? +argv.limit : Infinity;
 const FROM_DATE    = argv.from ? new Date(argv.from) : null;
 const TO_DATE      = argv.to ? new Date(argv.to) : null;
-const PER_EVENT_MS = Number.isFinite(+argv.perEventMs) ? +argv.perEventMs : 25000;
+const PER_EVENT_MS = Number.isFinite(+argv.perEventMs) ? +argv.perEventMs : 45000;
 if (typeof argv.headless === 'string') HEADLESS = argv.headless !== 'false';
 
 /* ---------- helpers ---------- */
@@ -102,9 +102,8 @@ function findStartInTextOnly(text, y, m, d){
 async function extractStartFromTicketsolveHeader(page, baseY, baseM, baseD){
   // wait briefly for the date/time row to render
   await page.waitForLoadState('domcontentloaded').catch(()=>{});
-  await page.waitForSelector('main, header, [role="main"]', { timeout: 4000 }).catch(()=>{});
-  // give React a beat to paint those spans
-  await page.waitForTimeout(600);
+  await page.waitForSelector('main, header, [role="main"]', { timeout: 6000 }).catch(()=>{});
+await page.waitForTimeout(1200);
 
   return await page.evaluate(({y,m,d})=>{
     const two=n=>String(n).padStart(2,'0');
@@ -173,8 +172,8 @@ async function sniffStartFromNetwork(page, baseY, baseM, baseD){
     }catch{}
   };
   page.on('response', onResp);
-  await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
-  await sleep(800);
+  await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(()=>{});
+await sleep(1500);
   page.off('response', onResp);
   return found;
 }
@@ -242,8 +241,13 @@ if (ticketsUrl){
   let seatsUrl = ticketsUrl;
   if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
   try{
-    await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
-    await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
+   // Ticketsolve seats
+await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
+await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+
+// DMH event page
+await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
+await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
 
     // run DOM parse and network sniff together; pick the first result
     const { y, m, d } = ymdFromUTCDate(new Date(currentStartISO));
