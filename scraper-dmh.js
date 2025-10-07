@@ -62,6 +62,33 @@ async function withDeadline(promise, ms, label='task'){
   ]);
 }
 
+// ---- timezone helpers (store both UTC + local wall-clock) ----
+const TZ = 'Europe/London';
+
+function localWallclockFromUTC(iso, tz = TZ) {
+  if (!iso) return { local: null, tz };
+  const d = new Date(iso);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(d);
+
+  const get = (t) => parts.find(p => p.type === t)?.value;
+  const y  = get('year');
+  const mo = get('month');
+  const da = get('day');
+  const hh = get('hour');
+  const mi = get('minute');
+
+  return { local: `${y}-${mo}-${da}T${hh}:${mi}:00`, tz };
+}
+
+
 /* ----------------------- TIME FINDER ----------------------- */
 async function extractStartFromTicketsolveRow(page, y, m, d){
   const two = n => String(n).padStart(2,'0');
@@ -730,12 +757,20 @@ async function main() {
 
       console.log(`  ↳ ${pct}% sold${start ? ' • ' + start : ''}`);
 
-      out.push({
-        title: c.title,
-        start,
-        status: (c.status || '').toUpperCase(),
-        override_pct: pct
-      });
+      const start_utc = start || null;
+const { local: start_local, tz } = localWallclockFromUTC(start_utc);
+
+out.push({
+  title: c.title,
+  // keep existing field for backward compatibility (UTC):
+  start: start_utc,
+  // ALSO include local wall-clock + timezone:
+  start_local,         // e.g. "2025-10-07T19:30:00" (no Z)
+  tz,                  // "Europe/London"
+  status: (c.status || '').toUpperCase(),
+  override_pct: pct
+});
+
     }
 
     const final = uniqBy(out, x => `${x.title}|${x.start}|${x.override_pct}`);
