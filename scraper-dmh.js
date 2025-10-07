@@ -63,6 +63,45 @@ async function withDeadline(promise, ms, label='task'){
 }
 
 /* ----------------------- TIME FINDER ----------------------- */
+async function extractStartFromTicketsolveRow(page, y, m, d){
+  const two = n => String(n).padStart(2,'0');
+
+  // Wait for the header row that contains the a11y "Dates:" label,
+  // or for any visible HH:MM near the top of the page.
+  await page.waitForLoadState('domcontentloaded').catch(()=>{});
+  await page.waitForSelector('main, header, [role="main"]', { timeout: 6000 }).catch(()=>{});
+  await page.waitForSelector('.sr-only:text-matches("^\\s*Dates:\\s*$", "i"), text=/\\b([01]?\\d|2[0-3]):([0-5]\\d)\\b/', { timeout: 6000 }).catch(()=>{});
+  await page.waitForTimeout(800); // give React a beat
+
+  // Prefer: same row as "Dates:" label
+  const hasLabel = page.locator('.sr-only').filter({ hasText: /(^|\s)Dates:\s*$/i });
+  if (await hasLabel.count()){
+    const row = hasLabel.first().locator('..'); // parent wrapper
+    const hhmm = await row.getByText(/\b([01]?\d|2[0-3]):([0-5]\d)\b/).first().textContent().catch(()=>null);
+    if (hhmm){
+      const m24 = hhmm.match(/([01]?\d|2[0-3]):([0-5]\d)/);
+      if (m24){
+        const hh = parseInt(m24[1],10), mi = parseInt(m24[2],10);
+        const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+        return isNaN(local.getTime()) ? null : local.toISOString();
+      }
+    }
+  }
+
+  // Fallback: first HH:MM anywhere near the top of the main content
+  const topScope = page.locator('main, header, [role="main"]').first();
+  const hhmmAny = await topScope.getByText(/\b([01]?\d|2[0-3]):([0-5]\d)\b/).first().textContent().catch(()=>null);
+  if (hhmmAny){
+    const m24 = hhmmAny.match(/([01]?\d|2[0-3]):([0-5]\d)/);
+    if (m24){
+      const hh = parseInt(m24[1],10), mi = parseInt(m24[2],10);
+      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+      return isNaN(local.getTime()) ? null : local.toISOString();
+    }
+  }
+  return null;
+}
+
 function ymdFromUTCDate(d){
   return { y: d.getUTCFullYear(), m: d.getUTCMonth()+1, d: d.getUTCDate() };
 }
@@ -230,49 +269,50 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
 /** Refine a midnight-only ISO by visiting Ticketsolve Seats first, then DMH page. */
 async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
   if (!currentStartISO) return null;
+
   const dt = new Date(currentStartISO);
   const { y, m, d } = ymdFromUTCDate(dt);
 
-  // keep if it already has a time
+  // If it already has a time, keep it.
   if (dt.getUTCHours() !== 0 || dt.getUTCMinutes() !== 0) return currentStartISO;
 
-  // 1) Ticketsolve first (fastest, clearly shows ", 19:30")
-if (ticketsUrl){
-  let seatsUrl = ticketsUrl;
-  if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
-  try{
-   // Ticketsolve seats
-await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
-await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+  // --- 1) Ticketsolve seats (preferred: clearly shows ", 19:30") ---
+  if (ticketsUrl){
+    let seatsUrl = ticketsUrl;
+    if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
 
-// DMH event page
-await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
-await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
-
-    // run DOM parse and network sniff together; pick the first result
-    const { y, m, d } = ymdFromUTCDate(new Date(currentStartISO));
-    const winner = await Promise.race([
-      (async()=> await extractStartISOFromPage(page, y, m, d))(),
-      (async()=> await sniffStartFromNetwork(page, y, m, d))()
-    ].map(p => p.then(v => v || null)));
-
-    if (winner) return winner;
-  }catch{}
-}
-
-
-  // 2) DMH event page fallback
-  if (eventUrl){
     try{
-      await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
-      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
-      const iso = await extractStartISOFromPage(page, y, m, d);
-      if (iso) return iso;
-    }catch{}
+      await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
+      await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+
+      // NEW: try the explicit "Dates:" row first
+      const explicit = await extractStartFromTicketsolveRow(page, y, m, d);
+      if (explicit) return explicit;
+
+      // Then run the generic DOM extractor + network sniffer in parallel on the seats page
+      const winner = await Promise.race([
+        (async()=> await extractStartISOFromPage(page, y, m, d))(),
+        (async()=> await sniffStartFromNetwork(page, y, m, d))()
+      ].map(p => p.then(v => v || null)));
+
+      if (winner) return winner;
+    } catch {}
   }
 
+  // --- 2) DMH event page fallback ---
+  if (eventUrl){
+    try{
+      await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 20000 });
+      await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+      const iso = await extractStartISOFromPage(page, y, m, d);
+      if (iso) return iso;
+    } catch {}
+  }
+
+  // Fallback: give up and keep the midnight date.
   return currentStartISO;
 }
+
 /* --------------------- END TIME FINDER --------------------- */
 
 
