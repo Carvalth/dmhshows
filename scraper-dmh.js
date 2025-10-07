@@ -100,36 +100,54 @@ function findStartInTextOnly(text, y, m, d){
  *  Structure is:  <div class="sr-only">Dates:</div><span>Tuesday 7 October 2025</span><span>, 19:30</span>
  */
 async function extractStartFromTicketsolveHeader(page, baseY, baseM, baseD){
-  // wait (briefly) for the “Dates:” label to appear
-  await page.waitForSelector('div.sr-only', { timeout: 4000 }).catch(()=>{});
+  // wait briefly for the date/time row to render
+  await page.waitForLoadState('domcontentloaded').catch(()=>{});
+  await page.waitForSelector('main, header, [role="main"]', { timeout: 4000 }).catch(()=>{});
+  // give React a beat to paint those spans
+  await page.waitForTimeout(600);
 
   return await page.evaluate(({y,m,d})=>{
     const two=n=>String(n).padStart(2,'0');
 
-    // Find the a11y-only label
-    const label = Array.from(document.querySelectorAll('div.sr-only'))
-      .find(el => /(^|\s)dates?:\s*$/i.test((el.textContent||'').trim()));
-    if (!label) return null;
+    // 1) prefer an explicit “Dates:” a11y label if present
+    const sr = Array.from(document.querySelectorAll('.sr-only'))
+      .find(n => /(^|\s)dates?:\s*$/i.test((n.textContent||'').trim()));
 
-    const root = label.parentElement || label.closest('div,section,header,main') || document.body;
-    const text = Array.from(root.querySelectorAll('span, time'))
-      .map(n => (n.textContent||'').trim())
-      .filter(Boolean)
-      .join(' ');
+    const scope = sr?.parentElement || document.querySelector('main, header, [role="main"]') || document.body;
 
-    // Prefer 24h
-    let mm = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-    if (mm){
-      const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
+    // collect nearby text (spans/time next to the label or in first “row” under the H1)
+    const buckets = [];
+    if (scope) {
+      const rowWithLabel = sr?.parentElement || scope;
+      buckets.push(
+        Array.from(rowWithLabel.querySelectorAll('span,time')).map(n => (n.textContent||'').trim()).join(' ')
+      );
+      // also scan first few rows under the title
+      const h1 = scope.querySelector('h1');
+      if (h1) {
+        let p = h1.parentElement;
+        for (let i=0;i<5 && p;i++, p=p.nextElementSibling) {
+          buckets.push(Array.from(p.querySelectorAll('span,time')).map(n => (n.textContent||'').trim()).join(' '));
+        }
+      }
+    }
+    buckets.push(document.body.innerText||'');
+
+    const join = buckets.filter(Boolean).join(' • ');
+
+    // 24h first
+    let m24 = join.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    if (m24){
+      const hh = parseInt(m24[1],10), mi = parseInt(m24[2],10);
       const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
       return isNaN(local.getTime()) ? null : local.toISOString();
     }
-    // Fallback 12h
-    mm = text.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
-    if (mm){
-      let hh = parseInt(mm[1],10);
-      const mi = mm[2] ? parseInt(mm[2],10) : 0;
-      const ap = mm[3].toLowerCase();
+    // 12h fallback
+    let m12 = join.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+    if (m12){
+      let hh = parseInt(m12[1],10);
+      const mi = m12[2] ? parseInt(m12[2],10) : 0;
+      const ap = m12[3].toLowerCase();
       if (ap==='pm' && hh<12) hh+=12;
       if (ap==='am' && hh===12) hh=0;
       const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
@@ -220,18 +238,24 @@ async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
   if (dt.getUTCHours() !== 0 || dt.getUTCMinutes() !== 0) return currentStartISO;
 
   // 1) Ticketsolve first (fastest, clearly shows ", 19:30")
-  if (ticketsUrl){
-    let seatsUrl = ticketsUrl;
-    if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
-    try{
-      await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
-      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
-      const iso = await extractStartISOFromPage(page, y, m, d);
-      if (iso) return iso;
-      const nIso = await sniffStartFromNetwork(page, y, m, d);
-      if (nIso) return nIso;
-    }catch{}
-  }
+if (ticketsUrl){
+  let seatsUrl = ticketsUrl;
+  if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
+  try{
+    await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
+    await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
+
+    // run DOM parse and network sniff together; pick the first result
+    const { y, m, d } = ymdFromUTCDate(new Date(currentStartISO));
+    const winner = await Promise.race([
+      (async()=> await extractStartISOFromPage(page, y, m, d))(),
+      (async()=> await sniffStartFromNetwork(page, y, m, d))()
+    ].map(p => p.then(v => v || null)));
+
+    if (winner) return winner;
+  }catch{}
+}
+
 
   // 2) DMH event page fallback
   if (eventUrl){
