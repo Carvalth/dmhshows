@@ -55,40 +55,6 @@ const isWhatsOn = (u) => /^https?:\/\/[^/]*demontforthall\.co\.uk\/whats-on\//i.
 
 async function ensureDir(p){ await fs.mkdir(p, { recursive: true }).catch(()=>{}); }
 
-async function extractStartFromTicketsolveHeader(page, baseY, baseM, baseD){
-  // looks for the "Dates:" sr-only label and grabs sibling spans (date + time)
-  const iso = await page.evaluate(({y,m,d})=>{
-    const two=n=>String(n).padStart(2,'0');
-    const label = Array.from(document.querySelectorAll('div.sr-only'))
-      .find(el => /dates?:/i.test(el.textContent || ''));
-    if (!label) return null;
-
-    const box = label.parentElement || label.closest('div,section,header,main') || document.body;
-    const text = Array.from(box.querySelectorAll('span, time')).map(n => (n.textContent||'').trim()).join(' ');
-    // prefer HH:MM
-    let mm = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-    if (mm) {
-      const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
-      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
-      return isNaN(local.getTime()) ? null : local.toISOString();
-    }
-    // fallback: 12h h(:mm)? am/pm
-    mm = text.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
-    if (mm){
-      let hh = parseInt(mm[1],10);
-      const mi = mm[2] ? parseInt(mm[2],10) : 0;
-      const ap = mm[3].toLowerCase();
-      if (ap==='pm' && hh<12) hh+=12;
-      if (ap==='am' && hh===12) hh=0;
-      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
-      return isNaN(local.getTime()) ? null : local.toISOString();
-    }
-    return null;
-  }, {y:baseY,m:baseM,d:baseD});
-  return iso || null;
-}
-
-
 async function withDeadline(promise, ms, label='task'){
   return Promise.race([
     promise,
@@ -96,56 +62,13 @@ async function withDeadline(promise, ms, label='task'){
   ]);
 }
 
-/* ---------- time extraction helpers ---------- */
-async function sniffStartFromNetwork(page, baseY, baseM, baseD){
-  let found = null;
-  const onResp = async (resp) => {
-    try{
-      const ct = (resp.headers()['content-type'] || '').toLowerCase();
-      if (!/json|text|javascript/.test(ct)) return;
-      const text = await resp.text();
-      if (!text) return;
-      // ISO-like first
-      found = found || findStartInISOish(text, baseY, baseM, baseD);
-      if (!found) {
-        // allow plain HH:MM if we also see the date nearby
-        if (text.includes(`${baseY}-${two(baseM)}-${two(baseD)}`)) {
-          found = findStartInTextOnly(text, baseY, baseM, baseD);
-        }
-      }
-    }catch{}
-  };
-  page.on('response', onResp);
-  // give it a short window to accumulate
-  await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
-  await sleep(800);
-  page.off('response', onResp);
-  return found;
-}
-
-function extractTimePartsFromText(txt=''){
-  // 24h HH:MM
-  let m = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-  if (m) return { h: parseInt(m[1],10), m: parseInt(m[2],10) };
-  // 12h h(:mm)? am/pm
-  m = txt.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
-  if (m){
-    let h = parseInt(m[1],10);
-    let mi = m[2] ? parseInt(m[2],10) : 0;
-    const ap = m[3].toLowerCase();
-    if (ap==='pm' && h<12) h+=12;
-    if (ap==='am' && h===12) h=0;
-    return { h, m: mi };
-  }
-  return null;
-}
+/* ----------------------- TIME FINDER ----------------------- */
 function ymdFromUTCDate(d){
   return { y: d.getUTCFullYear(), m: d.getUTCMonth()+1, d: d.getUTCDate() };
 }
 const two = (n)=>String(n).padStart(2,'0');
 
 function findStartInISOish(text, y, m, d){
-  // e.g. 2025-10-06T19:30, 2025-10-06 19:30:00Z etc.
   const datePat = `${y}-${two(m)}-${two(d)}`;
   const mIso = text.match(new RegExp(`${datePat}[T\\s]([01]?\\d|2[0-3]):([0-5]\\d)`));
   if (mIso){
@@ -155,9 +78,7 @@ function findStartInISOish(text, y, m, d){
   }
   return null;
 }
-
 function findStartInTextOnly(text, y, m, d){
-  // fall back: any HH:MM or h:mm am/pm on the page
   const m24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
   if (m24){
     const hh = parseInt(m24[1],10), mi = parseInt(m24[2],10);
@@ -175,26 +96,83 @@ function findStartInTextOnly(text, y, m, d){
   return null;
 }
 
-const pad = (n) => String(n).padStart(2,'0');
-function makeISOFromLocalParts(y,m,d,h,mi){
-  const local = new Date(`${y}-${pad(m)}-${pad(d)}T${pad(h)}:${pad(mi)}:00`);
-  return isNaN(local.getTime()) ? null : local.toISOString();
+/** Grab HH:MM from Ticketsolve Seats page header.
+ *  Structure is:  <div class="sr-only">Dates:</div><span>Tuesday 7 October 2025</span><span>, 19:30</span>
+ */
+async function extractStartFromTicketsolveHeader(page, baseY, baseM, baseD){
+  // wait (briefly) for the “Dates:” label to appear
+  await page.waitForSelector('div.sr-only', { timeout: 4000 }).catch(()=>{});
+
+  return await page.evaluate(({y,m,d})=>{
+    const two=n=>String(n).padStart(2,'0');
+
+    // Find the a11y-only label
+    const label = Array.from(document.querySelectorAll('div.sr-only'))
+      .find(el => /(^|\s)dates?:\s*$/i.test((el.textContent||'').trim()));
+    if (!label) return null;
+
+    const root = label.parentElement || label.closest('div,section,header,main') || document.body;
+    const text = Array.from(root.querySelectorAll('span, time'))
+      .map(n => (n.textContent||'').trim())
+      .filter(Boolean)
+      .join(' ');
+
+    // Prefer 24h
+    let mm = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    if (mm){
+      const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
+      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+      return isNaN(local.getTime()) ? null : local.toISOString();
+    }
+    // Fallback 12h
+    mm = text.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+    if (mm){
+      let hh = parseInt(mm[1],10);
+      const mi = mm[2] ? parseInt(mm[2],10) : 0;
+      const ap = mm[3].toLowerCase();
+      if (ap==='pm' && hh<12) hh+=12;
+      if (ap==='am' && hh===12) hh=0;
+      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+      return isNaN(local.getTime()) ? null : local.toISOString();
+    }
+    return null;
+  }, {y:baseY,m:baseM,d:baseD});
 }
 
+/** Sniff network payloads for a date+time signature. */
+async function sniffStartFromNetwork(page, baseY, baseM, baseD){
+  let found = null;
+  const onResp = async (resp) => {
+    try{
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!/json|text|javascript/.test(ct)) return;
+      const text = await resp.text();
+      if (!text) return;
+      found = found || findStartInISOish(text, baseY, baseM, baseD);
+      if (!found && text.includes(`${baseY}-${two(baseM)}-${two(baseD)}`)) {
+        found = findStartInTextOnly(text, baseY, baseM, baseD);
+      }
+    }catch{}
+  };
+  page.on('response', onResp);
+  await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(()=>{});
+  await sleep(800);
+  page.off('response', onResp);
+  return found;
+}
+
+/** Generic page extractor: <time datetime>, Ticketsolve header, JSON-LD, then body text. */
 async function extractStartISOFromPage(page, baseY, baseM, baseD){
-  // 1) <time datetime="...">
   try{
     const t = await page.locator('time[datetime]').first().getAttribute('datetime');
     if (t && /\dT\d/.test(t)) return new Date(t).toISOString();
   }catch{}
 
-  // 2) Ticketsolve header "Dates:" + spans
   try{
     const headerISO = await extractStartFromTicketsolveHeader(page, baseY, baseM, baseD);
     if (headerISO) return headerISO;
   }catch{}
 
-  // 3) schema.org JSON-LD
   try{
     const blocks = await page.$$eval('script[type="application/ld+json"]', ss => ss.map(s => s.textContent || ''));
     for (const b of blocks){
@@ -209,21 +187,16 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
     }
   }catch{}
 
-  // 4) whole page text (last resort)
   try{
     const txt = await page.evaluate(() => document.body.innerText || '');
-    // 24h HH:MM
     let mm = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
     if (mm){
-      const two=n=>String(n).padStart(2,'0');
       const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
       const local = new Date(`${baseY}-${two(baseM)}-${two(baseD)}T${two(hh)}:${two(mi)}:00`);
       if (!isNaN(local.getTime())) return local.toISOString();
     }
-    // 12h
     mm = txt.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
     if (mm){
-      const two=n=>String(n).padStart(2,'0');
       let hh = parseInt(mm[1],10);
       const mi = mm[2] ? parseInt(mm[2],10) : 0;
       const ap = mm[3].toLowerCase();
@@ -237,43 +210,42 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
   return null;
 }
 
-
+/** Refine a midnight-only ISO by visiting Ticketsolve Seats first, then DMH page. */
 async function discoverStartISO(page, currentStartISO, eventUrl, ticketsUrl){
   if (!currentStartISO) return null;
-  const { y, m, d } = ymdFromUTCDate(new Date(currentStartISO));
-
-  // if already has a time, keep it
   const dt = new Date(currentStartISO);
+  const { y, m, d } = ymdFromUTCDate(dt);
+
+  // keep if it already has a time
   if (dt.getUTCHours() !== 0 || dt.getUTCMinutes() !== 0) return currentStartISO;
 
-  // Try DMH event page (DOM/JSON-LD/text)
+  // 1) Ticketsolve first (fastest, clearly shows ", 19:30")
+  if (ticketsUrl){
+    let seatsUrl = ticketsUrl;
+    if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
+    try{
+      await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
+      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
+      const iso = await extractStartISOFromPage(page, y, m, d);
+      if (iso) return iso;
+      const nIso = await sniffStartFromNetwork(page, y, m, d);
+      if (nIso) return nIso;
+    }catch{}
+  }
+
+  // 2) DMH event page fallback
   if (eventUrl){
     try{
-      await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
+      await page.goto(eventUrl, { waitUntil:'domcontentloaded', timeout: 12000 });
       await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(()=>{});
       const iso = await extractStartISOFromPage(page, y, m, d);
       if (iso) return iso;
     }catch{}
   }
 
-  // Try Ticketsolve seats page (DOM + **network sniff**)
-  if (ticketsUrl){
-    let seatsUrl = ticketsUrl;
-    if (!/\/seats\b/.test(seatsUrl)) seatsUrl = seatsUrl.replace(/\/$/, '') + '/seats';
-    try{
-      await page.goto(seatsUrl, { waitUntil:'domcontentloaded', timeout: 30000 });
-      // First the DOM patterns:
-      const iso = await extractStartISOFromPage(page, y, m, d);
-      if (iso) return iso;
-      // Then the network payloads:
-      const nIso = await sniffStartFromNetwork(page, y, m, d);
-      if (nIso) return nIso;
-    }catch{}
-  }
-
-  // fallback
   return currentStartISO;
 }
+/* --------------------- END TIME FINDER --------------------- */
 
 
 /* ---------- list crawling ---------- */
