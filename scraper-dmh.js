@@ -55,6 +55,40 @@ const isWhatsOn = (u) => /^https?:\/\/[^/]*demontforthall\.co\.uk\/whats-on\//i.
 
 async function ensureDir(p){ await fs.mkdir(p, { recursive: true }).catch(()=>{}); }
 
+async function extractStartFromTicketsolveHeader(page, baseY, baseM, baseD){
+  // looks for the "Dates:" sr-only label and grabs sibling spans (date + time)
+  const iso = await page.evaluate(({y,m,d})=>{
+    const two=n=>String(n).padStart(2,'0');
+    const label = Array.from(document.querySelectorAll('div.sr-only'))
+      .find(el => /dates?:/i.test(el.textContent || ''));
+    if (!label) return null;
+
+    const box = label.parentElement || label.closest('div,section,header,main') || document.body;
+    const text = Array.from(box.querySelectorAll('span, time')).map(n => (n.textContent||'').trim()).join(' ');
+    // prefer HH:MM
+    let mm = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    if (mm) {
+      const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
+      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+      return isNaN(local.getTime()) ? null : local.toISOString();
+    }
+    // fallback: 12h h(:mm)? am/pm
+    mm = text.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+    if (mm){
+      let hh = parseInt(mm[1],10);
+      const mi = mm[2] ? parseInt(mm[2],10) : 0;
+      const ap = mm[3].toLowerCase();
+      if (ap==='pm' && hh<12) hh+=12;
+      if (ap==='am' && hh===12) hh=0;
+      const local = new Date(`${y}-${two(m)}-${two(d)}T${two(hh)}:${two(mi)}:00`);
+      return isNaN(local.getTime()) ? null : local.toISOString();
+    }
+    return null;
+  }, {y:baseY,m:baseM,d:baseD});
+  return iso || null;
+}
+
+
 async function withDeadline(promise, ms, label='task'){
   return Promise.race([
     promise,
@@ -154,24 +188,13 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
     if (t && /\dT\d/.test(t)) return new Date(t).toISOString();
   }catch{}
 
-  // 2) obvious “time” UI bits (common templates)
+  // 2) Ticketsolve header "Dates:" + spans
   try{
-    const tText = await page.evaluate(() => {
-      const pick = (sel) => Array.from(document.querySelectorAll(sel))
-        .map(n => (n.innerText || n.textContent || '').trim())
-        .filter(Boolean);
-      return [
-        ...pick('.event-time, .event__time, .performance-time, .showtime, .start-time, .time, .when, .details__time, [class*="time"]'),
-        ...pick('dl dt, dl dd, .meta, .event-meta, .performance-meta')
-      ].join('\n');
-    });
-    if (tText){
-      const iso = findStartInISOish(tText, baseY, baseM, baseD) || findStartInTextOnly(tText, baseY, baseM, baseD);
-      if (iso) return iso;
-    }
+    const headerISO = await extractStartFromTicketsolveHeader(page, baseY, baseM, baseD);
+    if (headerISO) return headerISO;
   }catch{}
 
-  // 3) JSON-LD (schema.org)
+  // 3) schema.org JSON-LD
   try{
     const blocks = await page.$$eval('script[type="application/ld+json"]', ss => ss.map(s => s.textContent || ''));
     for (const b of blocks){
@@ -186,11 +209,29 @@ async function extractStartISOFromPage(page, baseY, baseM, baseD){
     }
   }catch{}
 
-  // 4) final: whole page text
+  // 4) whole page text (last resort)
   try{
     const txt = await page.evaluate(() => document.body.innerText || '');
-    const iso = findStartInISOish(txt, baseY, baseM, baseD) || findStartInTextOnly(txt, baseY, baseM, baseD);
-    if (iso) return iso;
+    // 24h HH:MM
+    let mm = txt.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    if (mm){
+      const two=n=>String(n).padStart(2,'0');
+      const hh = parseInt(mm[1],10), mi = parseInt(mm[2],10);
+      const local = new Date(`${baseY}-${two(baseM)}-${two(baseD)}T${two(hh)}:${two(mi)}:00`);
+      if (!isNaN(local.getTime())) return local.toISOString();
+    }
+    // 12h
+    mm = txt.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+    if (mm){
+      const two=n=>String(n).padStart(2,'0');
+      let hh = parseInt(mm[1],10);
+      const mi = mm[2] ? parseInt(mm[2],10) : 0;
+      const ap = mm[3].toLowerCase();
+      if (ap==='pm' && hh<12) hh+=12;
+      if (ap==='am' && hh===12) hh=0;
+      const local = new Date(`${baseY}-${two(baseM)}-${two(baseD)}T${two(hh)}:${two(mi)}:00`);
+      if (!isNaN(local.getTime())) return local.toISOString();
+    }
   }catch{}
 
   return null;
