@@ -101,13 +101,35 @@
   </main>
 
   <script>
-    const fmt = new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric'});
-    const fmtDateTime = new Intl.DateTimeFormat(undefined,{year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'});
-    const fmtHM = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit'});
-    const fmtShort = new Intl.DateTimeFormat(undefined,{month:'short',day:'2-digit'});
+    const TZ = 'Europe/London';
+
+const fmt = new Intl.DateTimeFormat(undefined, {
+  year:'numeric', month:'long', day:'numeric', timeZone: TZ
+});
+const fmtDateTime = new Intl.DateTimeFormat(undefined, {
+  year:'numeric', month:'long', day:'numeric', hour:'2-digit', minute:'2-digit', timeZone: TZ
+});
+const fmtHM = new Intl.DateTimeFormat(undefined, {
+  hour:'2-digit', minute:'2-digit', timeZone: TZ
+});
+const fmtShort = new Intl.DateTimeFormat(undefined, {
+  month:'short', day:'2-digit', timeZone: TZ
+});
+
     function clamp(v,a,b){return Math.max(a,Math.min(b,Math.round(v)))}
     function pctSold(ev){ const n = Number(ev.override_pct); return Number.isFinite(n) ? clamp(n,0,100) : 0; }
-    function toLocalKey(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+    function toTzKeyFromISO(iso, tz = TZ){
+  if (!iso) return null;
+  const d = new Date(iso); // iso is UTC "Z" string
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit'
+  }).formatToParts(d);
+  const y  = parts.find(p=>p.type==='year').value;
+  const mo = parts.find(p=>p.type==='month').value;
+  const da = parts.find(p=>p.type==='day').value;
+  return `${y}-${mo}-${da}`;
+}
+
 
     const SAMPLE=[{title:"Level 42",start:"2025-10-06T19:00:00Z",status:"SOLD OUT",override_pct:100}];
     let state={events:[...SAMPLE],month:new Date(new Date().getFullYear(),new Date().getMonth(),1)};
@@ -132,21 +154,23 @@
       while(cells.length%7!==0) cells.push(null);
       return cells;
     }
-    function buildDayScores(events){
-  const map=new Map(); // key -> {pcts:number[], times:string[]}
-  for(const ev of events){
-    if(!ev.start) continue;
-    const d=new Date(ev.start);
-    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    const pct = pctSold(ev);
-    const t   = fmtHM.format(d);
+function buildDayScores(events){
+  const map=new Map();
+  for (const ev of events){
+    const iso = ev.start || null;          // UTC from your JSON
+    if (!iso) continue;
+
+    const key = toTzKeyFromISO(iso, TZ);   // bucket by Europe/London calendar day
+    const t   = fmtHM.format(new Date(iso)); // render wall-clock in Europe/London
+
     const cur = map.get(key) || {pcts:[], times:[]};
-    cur.pcts.push(pct);
+    cur.pcts.push(pctSold(ev));
     cur.times.push(t);
     map.set(key, cur);
   }
   return map;
 }
+
     function getColor(pct){
       if(pct>=99) return getComputedStyle(document.documentElement).getPropertyValue('--sold');
       if(pct>=75) return getComputedStyle(document.documentElement).getPropertyValue('--busy');
@@ -162,7 +186,7 @@
   for(const d of days){
     const cell=document.createElement('div');cell.className='day';
     if(d){
-      const key = toLocalKey(d);
+      const key = toTzKeyFromISO(d);
       const dayInfo = dayOccs.get(key) || {pcts:[],times:[]};
       const avgPct = dayInfo.pcts.length ? Math.round(dayInfo.pcts.reduce((a,b)=>a+b,0)/dayInfo.pcts.length) : 0;
 
